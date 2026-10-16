@@ -1,0 +1,649 @@
+openapi: 3.0.3
+info:
+  title: accounting-service
+  version: 1.0.0
+  description: >-
+    Contabilidad general (plugin `finance.general_ledger`): plan de cuentas, centros de costo, ejercicios y periodos, asientos de
+    partida doble y balance de comprobación / libro mayor. Todas las rutas van detrás del gateway con prefijo `/accounting`
+    (el gateway NO lo quita) y exigen el módulo contratado. Importes SIEMPRE en centavos enteros de la moneda base.
+    Fechas contables como `YYYY-MM-DD`. Un asiento contabilizado es inmutable: se corrige con una reversa.
+servers:
+  - url: http://localhost:3016
+tags:
+  - name: Configuración
+  - name: Plan de cuentas
+  - name: Periodos
+  - name: Asientos
+  - name: Contabilización automática
+  - name: Informes
+security:
+  - gatewayHeaders: []
+paths:
+  /health:
+    get:
+      summary: Estado del servicio (sin prefijo ni contexto)
+      security: []
+      responses:
+        '200': { description: ok }
+  /accounting/settings:
+    get:
+      tags: [Configuración]
+      summary: ¿La organización ya configuró su contabilidad?
+      description: 'Permiso: `account:read`.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured: { type: boolean }
+                  settings: { $ref: '#/components/schemas/Settings', nullable: true }
+  /accounting/setup:
+    post:
+      tags: [Configuración]
+      summary: Alta de la contabilidad (plan de cuentas de partida + primer ejercicio)
+      description: 'Permiso: `account:manage`. Se hace una sola vez; la segunda vez responde 409 `ACCOUNTING_ALREADY_SET_UP`.'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                chartTemplate: { type: string, enum: [ec-supercias, empty], default: ec-supercias }
+                fiscalYear: { type: integer, description: 'Por defecto el año actual.' }
+                baseCurrency: { type: string, example: USD }
+                fiscalYearStartMonth: { type: integer, minimum: 1, maximum: 12, default: 1 }
+                timezone: { type: string, example: America/Guayaquil }
+                autoPostingFrom: { type: string, format: date, description: 'Por defecto, el día del alta.' }
+      responses:
+        '201': { description: Configurada }
+        '409': { $ref: '#/components/responses/Error' }
+  /accounting/accounts:
+    get:
+      tags: [Plan de cuentas]
+      summary: Plan de cuentas ordenado por código
+      description: 'Permiso: `account:read`.'
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [active, inactive] } }
+        - { name: type, in: query, schema: { type: string, enum: [asset, liability, equity, income, cost, expense] } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Account' } }
+    post:
+      tags: [Plan de cuentas]
+      summary: Crear una cuenta
+      description: >-
+        Permiso: `account:manage`. El código de una subcuenta empieza por el de su padre más un punto. Colgar una subcuenta de una
+        cuenta de detalle sin movimientos la convierte en cuenta de agrupación.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name]
+              additionalProperties: false
+              properties:
+                code: { type: string, example: 1.1.01.02.01 }
+                name: { type: string }
+                type: { type: string, description: 'Obligatorio solo en una cuenta raíz.' }
+                parentId: { type: string, format: uuid, nullable: true }
+                isPostable: { type: boolean }
+                systemRole: { type: string, nullable: true }
+      responses:
+        '201': { description: Creada, content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /accounting/accounts/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Plan de cuentas]
+      summary: Detalle de una cuenta
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Plan de cuentas]
+      summary: Renombrar, activar/desactivar o mover el rol de sistema
+      description: >-
+        Permiso: `account:manage`. El código y el tipo no cambian. No se desactiva una cuenta con subcuentas activas.
+        `systemRole` mueve el rol (la cuenta que usan las reglas de contabilización automática) a esta cuenta; la que lo tenía
+        queda sin rol en la misma operación. `null` lo quita. Solo una cuenta de detalle puede llevar un rol.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                status: { type: string, enum: [active, inactive] }
+                systemRole: { type: string, nullable: true }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Account' } } } }
+  /accounting/cost-centers:
+    get:
+      tags: [Plan de cuentas]
+      summary: Centros de costo
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/CostCenter' } } } } }
+    post:
+      tags: [Plan de cuentas]
+      summary: Crear un centro de costo (código en mayúsculas, único)
+      description: 'Permiso: `account:manage`.'
+      responses:
+        '201': { description: Creado, content: { application/json: { schema: { $ref: '#/components/schemas/CostCenter' } } } }
+  /accounting/cost-centers/{id}:
+    patch:
+      tags: [Plan de cuentas]
+      summary: Renombrar o desactivar
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CostCenter' } } } }
+  /accounting/fiscal-years:
+    get:
+      tags: [Periodos]
+      summary: Ejercicios con sus periodos
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FiscalYear' } } } } }
+    post:
+      tags: [Periodos]
+      summary: Crear otro ejercicio (doce periodos abiertos)
+      description: 'Permiso: `period:manage`.'
+      requestBody:
+        content: { application/json: { schema: { type: object, required: [year], properties: { year: { type: integer } } } } }
+      responses:
+        '201': { description: Creado, content: { application/json: { schema: { $ref: '#/components/schemas/FiscalYear' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+  /accounting/periods/{id}/close:
+    post:
+      tags: [Periodos]
+      summary: Cerrar un periodo
+      description: >-
+        Permiso: `period:manage`. Se cierran en orden (409 `PREVIOUS_PERIOD_OPEN`) y sin borradores con fecha dentro
+        (409 `PERIOD_HAS_DRAFTS`). Un periodo cerrado rechaza asientos con 409 `PERIOD_CLOSED`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Cerrado, content: { application/json: { schema: { $ref: '#/components/schemas/Period' } } } }
+  /accounting/periods/{id}/reopen:
+    post:
+      tags: [Periodos]
+      summary: Reabrir un periodo (de atrás hacia adelante)
+      description: 'Permiso: `period:manage`. 409 `NEXT_PERIOD_CLOSED` si hay uno posterior cerrado.'
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Abierto, content: { application/json: { schema: { $ref: '#/components/schemas/Period' } } } }
+  /accounting/journal-entries:
+    get:
+      tags: [Asientos]
+      summary: Asientos (solo encabezado y totales), del más reciente al más antiguo
+      description: 'Permiso: `journal:read`. `pageSize` máximo 100.'
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [draft, posted] } }
+        - { name: kind, in: query, schema: { type: string, enum: [manual, automatic, reversal, opening] } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: accountId, in: query, schema: { type: string, format: uuid } }
+        - { name: sourceType, in: query, schema: { type: string } }
+        - { name: q, in: query, description: 'Busca en descripción y referencia.', schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 25 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Entry' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+    post:
+      tags: [Asientos]
+      summary: 'Crear un asiento (borrador, o contabilizado con `post: true`)'
+      description: >-
+        Permiso: `journal:create`; con `post: true` además `journal:post`. Debe cuadrar (debe = haber), llevar al menos dos líneas y
+        cada línea un importe en un solo lado. Las cuentas deben ser de detalle y estar activas. Si algo falla al contabilizar, no
+        queda ni el borrador.
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/EntryInput' } } }
+      responses:
+        '201': { description: Creado, content: { application/json: { schema: { $ref: '#/components/schemas/Entry' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /accounting/journal-entries/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Asientos]
+      summary: Detalle con líneas
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Entry' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Asientos]
+      summary: Reemplazar el contenido de un borrador
+      description: 'Permiso: `journal:create`. 409 `JOURNAL_ENTRY_NOT_DRAFT` si ya está contabilizado.'
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/EntryInput' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Entry' } } } }
+    delete:
+      tags: [Asientos]
+      summary: Eliminar un borrador
+      description: 'Permiso: `journal:create`. Un asiento contabilizado no se borra jamás.'
+      responses:
+        '204': { description: Eliminado }
+  /accounting/journal-entries/{id}/post:
+    post:
+      tags: [Asientos]
+      summary: Contabilizar un borrador
+      description: >-
+        Permiso: `journal:post`. Asigna el número `AS-<ejercicio>-<correlativo>` (sin huecos aunque haya muchas contabilizaciones a
+        la vez) y publica `accounting.journal_entry.posted`.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: Contabilizado, content: { application/json: { schema: { $ref: '#/components/schemas/Entry' } } } }
+  /accounting/journal-entries/{id}/reverse:
+    post:
+      tags: [Asientos]
+      summary: Reversar un asiento contabilizado
+      description: >-
+        Permiso: `journal:reverse`. Crea y contabiliza un asiento con debe y haber cambiados; el original queda marcado. Solo una
+        reversa por asiento (409 `JOURNAL_ENTRY_ALREADY_REVERSED`) y una reversa no se reversa. La fecha por defecto es la del
+        original; si su periodo está cerrado hay que indicar otra.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+                entryDate: { type: string, format: date }
+      responses:
+        '201':
+          description: Reversado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  original: { $ref: '#/components/schemas/Entry' }
+                  reversal: { $ref: '#/components/schemas/Entry' }
+  /accounting/posting-settings:
+    get:
+      tags: [Contabilización automática]
+      summary: Ajustes de la contabilización automática y cuántos pendientes hay
+      description: 'Permiso: `account:read`.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  settings: { $ref: '#/components/schemas/Settings' }
+                  pendingCount: { type: integer }
+                  defaultPaymentMethodRoles: { type: object, additionalProperties: { type: string, enum: [cash, bank, receivables] } }
+    put:
+      tags: [Contabilización automática]
+      summary: Cambiar los ajustes (parcial)
+      description: >-
+        Permiso: `account:manage`. `autoPosting` apaga o enciende la contabilización automática (apagada, los eventos quedan
+        pendientes). `autoPostingFrom` es el primer día que se contabiliza solo (`null` = sin límite): lo anterior se carga como
+        saldos iniciales. `paymentMethodRoles` dice a dónde va el cobro de cada forma de pago del SRI (`null` = valores por defecto).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                autoPosting: { type: boolean }
+                autoPostingFrom: { type: string, format: date, nullable: true }
+                timezone: { type: string, example: America/Guayaquil }
+                paymentMethodRoles: { type: object, nullable: true, additionalProperties: { type: string, enum: [cash, bank, receivables] } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Settings' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+  /accounting/pending-postings:
+    get:
+      tags: [Contabilización automática]
+      summary: Eventos que no se pudieron contabilizar solos
+      description: 'Permiso: `journal:read`. Más recientes primero.'
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, posted, discarded] } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 25 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PendingPosting' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+  /accounting/pending-postings/retry:
+    post:
+      tags: [Contabilización automática]
+      summary: Reintentar los pendientes (todos o los indicados)
+      description: >-
+        Permiso: `journal:post` (contabiliza asientos). Hasta 200 por llamada, los más antiguos primero. Devuelve cuántos se
+        contabilizaron, cuántos siguen pendientes y cuántos ya no aplican (se descartan).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ids: { type: array, items: { type: string, format: uuid }, maxItems: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  posted: { type: integer }
+                  stillPending: { type: integer }
+                  discarded: { type: integer }
+  /accounting/pending-postings/{id}/discard:
+    post:
+      tags: [Contabilización automática]
+      summary: Descartar un pendiente con un motivo
+      description: 'Permiso: `journal:post`. Para lo que no debe contabilizarse (p. ej. ya iba en los saldos iniciales). 409 si ya está resuelto.'
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        content: { application/json: { schema: { type: object, required: [reason], properties: { reason: { type: string } } } } }
+      responses:
+        '200': { description: Descartado, content: { application/json: { schema: { $ref: '#/components/schemas/PendingPosting' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /accounting/reports/trial-balance:
+    get:
+      tags: [Informes]
+      summary: Balance de comprobación
+      description: >-
+        Permiso: `ledger:read`. Saldo inicial, movimiento y saldo final por cuenta (positivo = deudor, negativo = acreedor), con las
+        cuentas de agrupación sumando a sus hijas. Las cuentas de resultados empiezan en cero cada ejercicio; lo de ejercicios
+        anteriores sin cerrar aparece en una fila `synthetic`.
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: includeZero, in: query, schema: { type: boolean } }
+        - { name: maxLevel, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: OK }
+  /accounting/reports/balance-sheet:
+    get:
+      tags: [Informes]
+      summary: Balance general a una fecha
+      description: >-
+        Permiso: `ledger:read`. Activo, pasivo y patrimonio en el sentido natural de cada cuenta (lo normal es positivo; una cuenta
+        regularizadora como la depreciación acumulada sale en negativo). El resultado del ejercicio y el de ejercicios anteriores
+        sin cerrar van como filas `synthetic` DENTRO del patrimonio, de modo que `totals.differenceCents` es 0 si los libros cuadran.
+        `compareAsOf` añade la comparación con otra fecha (p. ej. el cierre del año pasado). `maxLevel` oculta niveles sin cambiar los totales.
+      parameters:
+        - { name: asOf, in: query, required: true, schema: { type: string, format: date } }
+        - { name: compareAsOf, in: query, schema: { type: string, format: date } }
+        - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: includeZero, in: query, schema: { type: boolean } }
+        - { name: maxLevel, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asOf: { type: string, format: date }
+                  compareAsOf: { type: string, format: date, nullable: true }
+                  sections: { type: array, items: { $ref: '#/components/schemas/StatementSection' } }
+                  totals:
+                    type: object
+                    properties:
+                      assetsCents: { type: integer }
+                      liabilitiesAndEquityCents: { type: integer }
+                      differenceCents: { type: integer }
+                      compareAssetsCents: { type: integer, nullable: true }
+                      compareLiabilitiesAndEquityCents: { type: integer, nullable: true }
+                      compareDifferenceCents: { type: integer, nullable: true }
+        '422': { $ref: '#/components/responses/Error' }
+  /accounting/reports/income-statement:
+    get:
+      tags: [Informes]
+      summary: Estado de resultados de un rango
+      description: >-
+        Permiso: `ledger:read`. Secciones `income`, `costs` y `expenses` (costos y gastos no se mezclan aunque compartan la raíz 5),
+        utilidad bruta (ingresos − costos) y resultado neto (− gastos). Ingresos por el haber; costos y gastos por el debe: una
+        devolución en ventas resta de los ingresos. `compareFrom` y `compareTo` van juntos y añaden el periodo de comparación.
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: compareFrom, in: query, schema: { type: string, format: date } }
+        - { name: compareTo, in: query, schema: { type: string, format: date } }
+        - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: includeZero, in: query, schema: { type: boolean } }
+        - { name: maxLevel, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  compareFrom: { type: string, format: date, nullable: true }
+                  compareTo: { type: string, format: date, nullable: true }
+                  sections: { type: array, items: { $ref: '#/components/schemas/StatementSection' } }
+                  grossProfitCents: { type: integer }
+                  netResultCents: { type: integer }
+                  compareGrossProfitCents: { type: integer, nullable: true }
+                  compareNetResultCents: { type: integer, nullable: true }
+        '422': { $ref: '#/components/responses/Error' }
+  /accounting/reports/ledger:
+    get:
+      tags: [Informes]
+      summary: Libro mayor de una cuenta con saldo acumulado
+      description: 'Permiso: `ledger:read`. `pageSize` máximo 200; el saldo acumulado sigue de una página a otra.'
+      parameters:
+        - { name: accountId, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        '200': { description: OK }
+components:
+  securitySchemes:
+    gatewayHeaders:
+      type: apiKey
+      in: header
+      name: X-Organization-Id
+      description: >-
+        Las cabeceras `X-Organization-Id`, `X-User-Id` y `X-Permissions` las inyecta el api-gateway tras validar el JWT y el
+        módulo contratado. El servicio nunca valida tokens.
+  responses:
+    Error:
+      description: Error de negocio o validación
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              code: { type: string, example: JOURNAL_ENTRY_UNBALANCED }
+              message: { type: string }
+              details:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    field: { type: string }
+                    message: { type: string }
+  schemas:
+    Settings:
+      type: object
+      properties:
+        organizationId: { type: string, format: uuid }
+        chartTemplate: { type: string }
+        baseCurrency: { type: string, example: USD }
+        fiscalYearStartMonth: { type: integer }
+        initializedAt: { type: string, format: date-time }
+        timezone: { type: string, example: America/Guayaquil, description: 'De ella sale la fecha contable de los eventos.' }
+        autoPosting: { type: boolean }
+        autoPostingFrom: { type: string, format: date, nullable: true }
+        paymentMethodRoles: { type: object, nullable: true, additionalProperties: { type: string, enum: [cash, bank, receivables] } }
+    StatementSection:
+      type: object
+      properties:
+        key: { type: string, enum: [assets, liabilities, equity, income, costs, expenses] }
+        totalCents: { type: integer }
+        compareTotalCents: { type: integer, nullable: true }
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              accountId: { type: string, format: uuid, nullable: true }
+              code: { type: string }
+              name: { type: string }
+              level: { type: integer }
+              isPostable: { type: boolean }
+              synthetic: { type: boolean, description: 'Fila calculada (resultado del ejercicio, resultados anteriores sin cerrar).' }
+              amountCents: { type: integer }
+              compareAmountCents: { type: integer, nullable: true }
+    PendingPosting:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        eventType: { type: string, example: billing.invoice.issued }
+        sourceType: { type: string, example: invoice }
+        sourceId: { type: string }
+        reasonCode: { type: string, example: MISSING_ROLE, description: 'MISSING_ROLE, PERIOD_CLOSED, PERIOD_NOT_FOUND, ACCOUNT_NOT_POSTABLE, AUTO_POSTING_OFF, UNMAPPED_TAX_KIND, UNBALANCED_SOURCE, CURRENCY_MISMATCH…' }
+        reasonMessage: { type: string }
+        status: { type: string, enum: [pending, posted, discarded] }
+        attempts: { type: integer }
+        entryId: { type: string, format: uuid, nullable: true }
+        entryDate: { type: string, format: date, nullable: true }
+        createdAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+    Account:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: 1.1.01.01 }
+        name: { type: string }
+        type: { type: string, enum: [asset, liability, equity, income, cost, expense] }
+        parentId: { type: string, format: uuid, nullable: true }
+        level: { type: integer }
+        isPostable: { type: boolean }
+        status: { type: string, enum: [active, inactive] }
+        systemRole: { type: string, nullable: true }
+    CostCenter:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        status: { type: string, enum: [active, inactive] }
+    Period:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fiscalYearId: { type: string, format: uuid }
+        number: { type: integer }
+        startDate: { type: string, format: date }
+        endDate: { type: string, format: date }
+        status: { type: string, enum: [open, closed] }
+        closedAt: { type: string, format: date-time, nullable: true }
+    FiscalYear:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        year: { type: integer }
+        startDate: { type: string, format: date }
+        endDate: { type: string, format: date }
+        periods: { type: array, items: { $ref: '#/components/schemas/Period' } }
+    Line:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lineNo: { type: integer }
+        accountId: { type: string, format: uuid }
+        debitCents: { type: integer }
+        creditCents: { type: integer }
+        description: { type: string, nullable: true }
+        costCenterId: { type: string, format: uuid, nullable: true }
+        projectId: { type: string, format: uuid, nullable: true }
+        establishmentId: { type: string, format: uuid, nullable: true }
+        partyType: { type: string, enum: [customer, supplier, employee], nullable: true }
+        partyId: { type: string, format: uuid, nullable: true }
+        currencyCode: { type: string, nullable: true }
+        amountFcCents: { type: integer, nullable: true }
+        exchangeRate: { type: number, nullable: true }
+    Entry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        number: { type: string, nullable: true, example: 'AS-2026-000123', description: 'Null mientras es borrador.' }
+        entryDate: { type: string, format: date }
+        description: { type: string }
+        reference: { type: string, nullable: true }
+        status: { type: string, enum: [draft, posted] }
+        kind: { type: string, enum: [manual, automatic, reversal, opening] }
+        sourceType: { type: string, nullable: true }
+        sourceId: { type: string, nullable: true }
+        currencyCode: { type: string }
+        totalDebitCents: { type: integer }
+        totalCreditCents: { type: integer }
+        reversesEntryId: { type: string, format: uuid, nullable: true }
+        reversedByEntryId: { type: string, format: uuid, nullable: true }
+        lines: { type: array, items: { $ref: '#/components/schemas/Line' }, description: 'Solo en el detalle.' }
+    EntryInput:
+      type: object
+      required: [entryDate, description, lines]
+      additionalProperties: false
+      properties:
+        entryDate: { type: string, format: date }
+        description: { type: string, maxLength: 255 }
+        reference: { type: string, nullable: true, maxLength: 60 }
+        post: { type: boolean, default: false, description: 'Solo al crear.' }
+        lines:
+          type: array
+          minItems: 2
+          maxItems: 500
+          items:
+            type: object
+            required: [accountId]
+            properties:
+              accountId: { type: string, format: uuid }
+              debitCents: { type: integer, minimum: 0 }
+              creditCents: { type: integer, minimum: 0 }
+              description: { type: string, nullable: true }
+              costCenterId: { type: string, format: uuid, nullable: true }
+              projectId: { type: string, format: uuid, nullable: true }
+              establishmentId: { type: string, format: uuid, nullable: true }
+              partyType: { type: string, enum: [customer, supplier, employee], nullable: true }
+              partyId: { type: string, format: uuid, nullable: true }
+              currencyCode: { type: string, nullable: true }
+              amountFcCents: { type: integer, nullable: true }
+              exchangeRate: { type: number, nullable: true }

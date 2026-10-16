@@ -1,0 +1,161 @@
+asyncapi: 2.6.0
+info:
+  title: accounting-service — eventos
+  version: 1.0.0
+  description: >-
+    accounting-service PUBLICA estos eventos en el exchange `crm.events` (patrón Outbox, @facturero/outbox-relay) y CONSUME los de
+    facturación e inventario (cola `accounting-service.events`) para generar asientos automáticos. Todo payload lleva `organizationId` y, añadidos por el relay, actor, IP y request-id.
+    Los importes van en centavos de la moneda base.
+channels:
+  billing.invoice.issued:
+    subscribe:
+      summary: Factura (01) o nota de crédito (04) emitida → asiento automático
+      description: >-
+        Factura: Dr clientes (o caja/bancos si trae forma de pago) / Cr ventas + IVA por pagar. Nota de crédito: lo inverso contra
+        devoluciones en ventas. Otros comprobantes se ignoran. Usa `issueDate` en la zona horaria de la organización como fecha contable.
+  billing.invoice.voided:
+    subscribe:
+      summary: Factura anulada → reversa del asiento automático
+  inventory.stock.consumed:
+    subscribe:
+      summary: Venta (sale_out) → Dr costo de ventas / Cr inventario, por el COSTO (`totalCostCents`)
+  inventory.stock.entered:
+    subscribe:
+      summary: >-
+        Reposición por anulación (adjustment_in, inventory_in) → Dr inventario / Cr costo de ventas; saldo inicial
+        (opening_balance) → Dr inventario / Cr ganancias acumuladas. La compra (purchase_in) NO se contabiliza aquí.
+  inventory.stock.adjusted:
+    subscribe:
+      summary: Sobrante → ganancia por ajuste; merma → mermas; uso interno → otros gastos
+      description: Usa `occurredAt` del movimiento como fecha contable (si falta, la hora de llegada).
+  fiscal.ec.withholding.issued:
+    subscribe:
+      summary: Retención autorizada por el SRI → Dr proveedores / Cr retenciones por pagar (renta e IVA)
+      description: >-
+        Lo publica fiscal-ecuador al AUTORIZARSE una retención emitida a un proveedor (no al crearla). Usa `issueDate` en la zona
+        horaria de la organización como fecha contable. Supone que la compra ya está en proveedores. Si incluye ISD (sin cuenta
+        todavía) queda pendiente (UNMAPPED_TAX_KIND).
+  plugin.activated:
+    subscribe:
+      summary: Si el código es `finance.general_ledger`, enciende la contabilización automática
+  plugin.deactivated:
+    subscribe:
+      summary: Si el código es `finance.general_ledger`, la apaga (los eventos quedan pendientes)
+  accounting.posting.pending:
+    publish:
+      summary: Un evento no pudo contabilizarse solo (una persona tiene que resolverlo)
+      message:
+        payload:
+          type: object
+          properties: { pendingId: { type: string }, eventType: { type: string }, sourceType: { type: string }, sourceId: { type: string }, reasonCode: { type: string }, reasonMessage: { type: string }, entryDate: { type: string, nullable: true } }
+  accounting.posting.resolved:
+    publish:
+      summary: Un pendiente se contabilizó o se descartó
+      message:
+        payload:
+          type: object
+          properties: { pendingId: { type: string }, outcome: { type: string, enum: [posted, discarded] }, entryId: { type: string, nullable: true }, attempts: { type: integer }, reason: { type: string } }
+  accounting.posting_settings.updated:
+    publish:
+      summary: Cambió la contabilización automática (interruptor, fecha de inicio, formas de pago, zona horaria)
+      message:
+        payload:
+          type: object
+          properties: { autoPosting: { type: boolean }, autoPostingFrom: { type: string, nullable: true }, timezone: { type: string }, paymentMethodRoles: { type: object, nullable: true }, previous: { type: object } }
+  accounting.setup.completed:
+    publish:
+      summary: La organización configuró su contabilidad
+      message:
+        payload:
+          type: object
+          properties: { organizationId: { type: string }, chartTemplate: { type: string }, baseCurrency: { type: string }, accountCount: { type: integer }, fiscalYear: { type: integer } }
+  accounting.account.created:
+    publish:
+      summary: Cuenta creada
+      message: { payload: { $ref: '#/components/schemas/Account' } }
+  accounting.account.updated:
+    publish:
+      summary: Cuenta renombrada o activada/desactivada (incluye `previous`)
+      message: { payload: { $ref: '#/components/schemas/Account' } }
+  accounting.cost_center.upserted:
+    publish:
+      summary: Centro de costo creado o modificado
+      message:
+        payload:
+          type: object
+          properties: { costCenterId: { type: string }, code: { type: string }, name: { type: string }, status: { type: string } }
+  accounting.fiscal_year.created:
+    publish:
+      summary: Ejercicio fiscal creado con sus doce periodos
+      message:
+        payload:
+          type: object
+          properties: { fiscalYearId: { type: string }, year: { type: integer }, startDate: { type: string }, endDate: { type: string } }
+  accounting.period.closed:
+    publish:
+      summary: Periodo cerrado
+      message: { payload: { $ref: '#/components/schemas/Period' } }
+  accounting.period.reopened:
+    publish:
+      summary: Periodo reabierto
+      message: { payload: { $ref: '#/components/schemas/Period' } }
+  accounting.journal_entry.saved:
+    publish:
+      summary: Borrador creado o modificado
+      message: { payload: { $ref: '#/components/schemas/Entry' } }
+  accounting.journal_entry.deleted:
+    publish:
+      summary: Borrador eliminado
+      message: { payload: { $ref: '#/components/schemas/Entry' } }
+  accounting.journal_entry.posted:
+    publish:
+      summary: Asiento contabilizado (el hecho que consumen reportes y BI)
+      message:
+        payload:
+          allOf:
+            - $ref: '#/components/schemas/Entry'
+            - type: object
+              properties:
+                periodId: { type: string }
+                reversesEntryId: { type: string, nullable: true }
+                lines:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      accountId: { type: string }
+                      debitCents: { type: integer }
+                      creditCents: { type: integer }
+                      costCenterId: { type: string, nullable: true }
+                      partyType: { type: string, nullable: true }
+                      partyId: { type: string, nullable: true }
+  accounting.journal_entry.reversed:
+    publish:
+      summary: Un asiento fue anulado por una reversa
+      message:
+        payload:
+          type: object
+          properties: { entryId: { type: string }, number: { type: string }, reversalEntryId: { type: string }, reversalNumber: { type: string }, reason: { type: string } }
+components:
+  schemas:
+    Account:
+      type: object
+      properties: { accountId: { type: string }, code: { type: string }, name: { type: string }, type: { type: string }, parentId: { type: string, nullable: true }, isPostable: { type: boolean }, status: { type: string }, systemRole: { type: string, nullable: true } }
+    Period:
+      type: object
+      properties: { periodId: { type: string }, fiscalYearId: { type: string }, number: { type: integer }, startDate: { type: string }, endDate: { type: string }, status: { type: string } }
+    Entry:
+      type: object
+      properties:
+        entryId: { type: string }
+        number: { type: string, nullable: true }
+        entryDate: { type: string }
+        description: { type: string }
+        status: { type: string }
+        kind: { type: string }
+        sourceType: { type: string, nullable: true }
+        sourceId: { type: string, nullable: true }
+        currencyCode: { type: string }
+        totalDebitCents: { type: integer }
+        totalCreditCents: { type: integer }
+        lineCount: { type: integer }
