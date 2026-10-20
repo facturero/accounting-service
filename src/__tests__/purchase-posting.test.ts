@@ -273,3 +273,49 @@ describe('convivencia con la retención y con el inventario', () => {
     expect(entries()).toHaveLength(0);
   });
 });
+
+// Regresión (apareció al levantar la pila completa): compras y fiscal mandan `issueDate` como fecha SIN hora («2026-10-20»). Pasarla
+// por `new Date()` la tomaba como medianoche UTC y en Guayaquil salía el día ANTERIOR: el asiento caía un día antes (otro periodo si
+// era el 1.º de mes) y `auto_posting_from` lo descartaba. Las pruebas de arriba usan marcas de tiempo completas y no lo veían.
+describe('fecha sin hora (issueDate de compras y de fiscal)', () => {
+  it('la factura de compra se asienta el MISMO día que dice su fecha, no el anterior', async () => {
+    await posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-10-20' }));
+    expect(entries()[0]!.entryDate).toBe('2026-10-20');
+  });
+
+  it('el 1.º de mes no cae en el mes anterior', async () => {
+    await env.uc.updatePostingSettings.execute({ organizationId: ORG_A, autoPostingFrom: '2026-10-15' });
+    await posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-11-01' }));
+    expect(entries()[0]!.entryDate).toBe('2026-11-01');
+  });
+
+  it('una factura fechada EXACTAMENTE el día de inicio de la contabilización automática sí se asienta', async () => {
+    await env.uc.updatePostingSettings.execute({ organizationId: ORG_A, autoPostingFrom: '2026-10-20' });
+    const res = await posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-10-20' }));
+    expect(res.outcome).toBe('posted');
+  });
+
+  it('una anterior a ese día sigue ignorándose', async () => {
+    await env.uc.updatePostingSettings.execute({ organizationId: ORG_A, autoPostingFrom: '2026-10-20' });
+    const res = await posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-10-19' }));
+    expect(res.outcome).toBe('ignored');
+  });
+
+  it('la retención de fiscal (fecha sin hora) tampoco se corre un día', async () => {
+    await posting.handle('fiscal.ec.withholding.issued', {
+      organizationId: ORG_A, withholdingId: uuid(), number: '001-001-000000007', issueDate: '2026-10-20', establishmentId: EST,
+      currencyCode: 'USD', supplier: { identification: '1790012345001', businessName: 'Proveedor Andino' },
+      incomeTaxWithheldCents: 100, vatWithheldCents: 450, isdWithheldCents: 0, totalWithheldCents: 550,
+    });
+    expect(entries()[0]!.entryDate).toBe('2026-10-20');
+  });
+
+  it('una fecha con hora sigue convirtiéndose a la zona de la organización (20:00 en Guayaquil ya es mañana en UTC)', async () => {
+    await posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-10-21T01:30:00.000Z' }));
+    expect(entries()[0]!.entryDate).toBe('2026-10-20');
+  });
+
+  it('una fecha imposible se rechaza en vez de asentarse en una fecha inventada', async () => {
+    await expect(posting.handle('purchasing.bill.posted', billEvent({ issueDate: '2026-13-45' }))).rejects.toThrow();
+  });
+});

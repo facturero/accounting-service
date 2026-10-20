@@ -133,8 +133,21 @@ export function collectionRoleFor(code: string | null | undefined, overrides: Re
   return overrides?.[code] ?? DEFAULT_PAYMENT_METHOD_ROLES[code] ?? 'receivables';
 }
 
-/** Fecha local `YYYY-MM-DD` de un instante en una zona horaria: una venta a las 20:00 en Guayaquil ya es «mañana» en UTC. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Fecha local `YYYY-MM-DD` de un instante en una zona horaria: una venta a las 20:00 en Guayaquil ya es «mañana» en UTC.
+ *
+ * Una fecha SIN hora (`2026-10-20`: la que mandan compras y fiscal en `issueDate`) ya ES una fecha local: no se convierte. Pasarla
+ * por `new Date()` la toma como medianoche UTC y en Guayaquil (UTC-5) sale el día ANTERIOR: el asiento caía un día antes (en otro
+ * periodo si era el 1.º de mes) y el filtro de `auto_posting_from` lo descartaba. Las pruebas usaban marcas de tiempo completas
+ * y no lo vieron; apareció al levantar la pila completa.
+ */
 export function localDateOf(instant: string | Date, timeZone: string): string {
+  if (typeof instant === 'string' && DATE_ONLY.test(instant)) {
+    if (Number.isNaN(new Date(`${instant}T00:00:00Z`).getTime())) throw new Error(`fecha inválida: ${instant}`);
+    return instant;
+  }
   const d = typeof instant === 'string' ? new Date(instant) : instant;
   if (Number.isNaN(d.getTime())) throw new Error(`fecha inválida: ${String(instant)}`);
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
