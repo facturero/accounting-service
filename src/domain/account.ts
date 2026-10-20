@@ -34,6 +34,7 @@ export const SYSTEM_ROLES = [
   'income_tax_withheld_receivable', 'payables', 'customer_advances', 'vat_payable', 'vat_withholding_payable',
   'income_tax_withholding_payable', 'retained_earnings', 'current_result', 'sales_revenue', 'services_revenue',
   'sales_returns', 'other_income', 'inventory_gain', 'cogs', 'inventory_shrinkage', 'other_expense',
+  'purchase_price_variance',
 ] as const;
 export type SystemRole = (typeof SYSTEM_ROLES)[number];
 

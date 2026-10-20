@@ -35,6 +35,27 @@ channels:
         Lo publica fiscal-ecuador al AUTORIZARSE una retención emitida a un proveedor (no al crearla). Usa `issueDate` en la zona
         horaria de la organización como fecha contable. Supone que la compra ya está en proveedores. Si incluye ISD (sin cuenta
         todavía) queda pendiente (UNMAPPED_TAX_KIND).
+
+  purchasing.bill.posted:
+    subscribe:
+      summary: Factura de compra contabilizada (01, 03*) → Dr inventario/gasto + IVA crédito / Cr proveedores
+      description: >-
+        Cr `payables` por total; Dr `inventory` (subtotal stock + ICE/IRBPNR, sin IVA), Dr `other_expense` (gasto), Dr `vat_credit` (IVA), Dr/Cr `purchase_price_variance` (override).
+        *docType 03 (liquidación) se IGNORA aquí: su asiento nace de `fiscal.ec.purchase_settlement.issued`.
+        Moneda ≠ base → CURRENCY_MISMATCH (pendiente). Idempotente por sourceType=purchase_bill.
+
+  purchasing.bill.voided:
+    subscribe:
+      summary: Factura de compra anulada → reversa del asiento de la factura
+      description: Reversa el asiento automático de la factura de compra; si estaba pendiente sin asiento, descarta el pendiente.
+
+  fiscal.ec.purchase_settlement.issued:
+    subscribe:
+      summary: Liquidación de compra autorizada (03) → mismo asiento que factura de compra
+      description: >-
+        Para no duplicar con purchasing.bill.posted (que ignora docType 03): el asiento nace de ESTE evento (autorizado = existe legalmente).
+        Mismo asiento: Cr proveedores / Dr inventario/gasto + IVA crédito + price_variance si aplica.
+
   plugin.activated:
     subscribe:
       summary: Si el código es `finance.general_ledger`, enciende la contabilización automática

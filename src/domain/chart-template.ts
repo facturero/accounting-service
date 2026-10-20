@@ -121,6 +121,7 @@ export const EC_SUPERCIAS_TEMPLATE: readonly TemplateAccount[] = [
   { code: '5.2.08', name: 'Gastos bancarios', type: X },
   { code: '5.2.09', name: 'Intereses y gastos financieros', type: X },
   { code: '5.2.10', name: 'Impuestos, contribuciones y otros', type: X },
+  { code: '5.2.11', name: 'Diferencias de precio en compras', type: X, role: 'purchase_price_variance' },
   { code: '5.2.99', name: 'Otros gastos', type: X, role: 'other_expense' },
 ];
 

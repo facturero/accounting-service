@@ -1,6 +1,68 @@
 import type { PartyType } from './journal.js';
 import type { SystemRole } from './account.js';
 
+/** Payload mínimo de factura de compra contabilizada (purchasing.bill.posted) — vienen centavos y texto. */
+export interface PurchaseBillPostedPayload {
+  billId: string;
+  internalNumber?: string | null;
+  supplierId: string;
+  supplier: { identification?: string; legalName?: string } | null;
+  docType: string;
+  supplierDocument: string;
+  issueDate?: string | null;
+  dueDate?: string | null;
+  currencyCode: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  establishmentId?: string | null;
+  orderId?: string | null;
+  matchStatus: string;
+  lines: Array<{
+    kind: 'stock' | 'expense';
+    productId?: string | null;
+    expenseAccountHint?: string | null;
+    subtotalCents: number;
+    vatCents: number;
+    iceCents: number;
+    irbpnrCents: number;
+    priceVarianceCents: number;
+  }>;
+}
+
+/** Payload de factura de compra anulada (purchasing.bill.voided). */
+export interface PurchaseBillVoidedPayload {
+  billId: string;
+  reason?: string | null;
+}
+
+/** Payload de liquidación de compra autorizada (fiscal.ec.purchase_settlement.issued). */
+export interface PurchaseSettlementIssuedPayload {
+  documentId: string;
+  internalNumber?: string | null;
+  supplierId: string;
+  supplier: { identification?: string; legalName?: string } | null;
+  docType: string;
+  supplierDocument: string;
+  issueDate?: string | null;
+  dueDate?: string | null;
+  currencyCode: string;
+  subtotalCents: number;
+  taxCents: number;
+  totalCents: number;
+  establishmentId?: string | null;
+  lines: Array<{
+    kind: 'stock' | 'expense';
+    productId?: string | null;
+    expenseAccountHint?: string | null;
+    subtotalCents: number;
+    vatCents: number;
+    iceCents: number;
+    irbpnrCents: number;
+    priceVarianceCents: number;
+  }>;
+}
+
 /**
  * Reglas de contabilización: de un evento de otro servicio a las líneas de un asiento. Son funciones PURAS (sin base de datos):
  * devuelven qué cuenta —por ROL— va al debe y cuál al haber, y los importes. Resolver el rol a una cuenta concreta y escribir el
@@ -322,5 +384,209 @@ export function draftFromStockMovement(eventType: string, p: StockMovementPayloa
       { role: debit, debitCents: cost, creditCents: 0 },
       { role: credit, debitCents: 0, creditCents: cost },
     ],
+  };
+}
+
+// ── Factura de compra (purchasing.bill.posted) ────────────────────────────────
+
+/**
+ * Factura de compra contabilizada (doc_type 01 y 03 ya autorizada).
+ *
+ * - Cr `payables` por el TOTAL de la factura (con el proveedor como tercero: `party`).
+ * - Dr `inventory` por el subtotal de las líneas `stock` (más ICE/IRBPNR si forman parte del costo; IVA crédito NO va al costo por defecto).
+ * - Dr `other_expense` (o la cuenta indicada por `expenseAccountHint` si existe, es de detalle y activa; si no, el rol por defecto) por las líneas `expense`.
+ * - Dr `vat_credit` por el IVA de la factura SOLO si la organización puede usar crédito tributario; por defecto sí.
+ * - Diferencia de precio de compra (`priceVarianceCents ≠ 0` en líneas `stock` aprobadas con override): lleva la diferencia al rol `purchase_price_variance` (Dr si la factura costó más, Cr si costó menos) EN LUGAR de al inventario.
+ * - Cuadre: Σ débitos = Σ créditos por construcción; si no, `UNBALANCED_SOURCE`.
+ * - Moneda ≠ base → `CURRENCY_MISMATCH` (pendiente). Rol sin cuenta → queda en "Pendientes".
+ * - Idempotente: `sourceType: 'purchase_bill'`, `sourceId: billId`.
+ *
+ * NOTA: las líneas de servicio o sin stock se pueden "recibir" (cuentan para cerrar la orden) pero inventario las ignora; aquí también ignoramos `kind !== 'stock'` para el Dr inventory.
+ * DECISIÓN: el asiento nace de `fiscal.ec.purchase_settlement.issued` para liquidaciones (docType 03); `purchasing.bill.posted` ignora `docType === '03'` para no duplicar.
+ */
+export function draftFromPurchaseBillPosted(p: PurchaseBillPostedPayload, ctx: RuleContext): PostingRuleResult {
+  const sourceType = 'purchase_bill';
+  const blocked = (reasonCode: string, message: string): PostingBlocked => ({ kind: 'blocked', reasonCode, message, sourceType, sourceId: p.billId });
+
+  // Ignorar liquidaciones (docType 03): su asiento nace de fiscal.ec.purchase_settlement.issued
+  if (p.docType === '03') return { kind: 'skip', reason: 'liquidación de compra se contabiliza desde fiscal.ec.purchase_settlement.issued' };
+
+  if ((p.currencyCode ?? ctx.baseCurrency) !== ctx.baseCurrency) {
+    return blocked('CURRENCY_MISMATCH', `La factura de compra está en ${p.currencyCode} y la contabilidad lleva ${ctx.baseCurrency}.`);
+  }
+  const total = asCents(p.totalCents);
+  if (total <= 0) return { kind: 'skip', reason: 'factura de compra sin importe' };
+
+  // Validar cuadre: total = subtotal + tax + ice + irbpnr (aprox, tolerancia 1 centavo por redondeo de proveedor)
+  const linesSubtotal = p.lines.reduce((sum, l) => sum + asCents(l.subtotalCents), 0);
+  const linesTax = p.lines.reduce((sum, l) => sum + asCents(l.vatCents) + asCents(l.iceCents) + asCents(l.irbpnrCents), 0);
+  if (Math.abs(total - (linesSubtotal + linesTax)) > 1) {
+    return blocked('UNBALANCED_SOURCE', `Total factura (${total}) ≠ subtotal+impuestos (${linesSubtotal + linesTax}) en centavos.`);
+  }
+
+  const est = p.establishmentId ?? null;
+  const party = { partyType: 'supplier' as const, partyId: p.supplierId };
+
+  const lines: DraftLine[] = [];
+
+  // 1) Cr payables por el TOTAL (con proveedor como tercero)
+  lines.push({ role: 'payables', debitCents: 0, creditCents: total, establishmentId: est, ...party });
+
+  // 2) Dr inventory por líneas stock (subtotal + ICE/IRBPNR; IVA NO va al costo).
+  //    Con una variación de precio aprobada (override) el inventario entra al costo de la ORDEN y la
+  //    diferencia se lleva a purchase_price_variance (paso 5): al inventario va `costo − variación`.
+  let inventorySubtotal = 0;
+  for (const line of p.lines) {
+    if (line.kind !== 'stock') continue;
+    const lineCost = asCents(line.subtotalCents) + asCents(line.iceCents) + asCents(line.irbpnrCents);
+    const toInventory = lineCost - asCents(line.priceVarianceCents);
+    if (toInventory > 0) inventorySubtotal += toInventory;
+  }
+  if (inventorySubtotal > 0) lines.push({ role: 'inventory', debitCents: inventorySubtotal, creditCents: 0, establishmentId: est });
+
+  // 3) Dr other_expense (o expenseAccountHint si existe y es detalle/activa) por líneas expense
+  for (const line of p.lines) {
+    if (line.kind !== 'expense') continue;
+    const expSub = asCents(line.subtotalCents);
+    const expIce = asCents(line.iceCents);
+    const expIrbpnr = asCents(line.irbpnrCents);
+    const expCost = expSub + expIce + expIrbpnr;
+    if (expCost > 0) {
+      // Si hay expenseAccountHint, se resolvería en automatic-posting si existe una cuenta con ese hint y está activa;
+      // por simplicidad usamos other_expense (rol por defecto). El hint se guarda en la descripción.
+      const desc = line.expenseAccountHint ? ` (cuenta sugerida: ${line.expenseAccountHint})` : '';
+      lines.push({ role: 'other_expense', debitCents: expCost, creditCents: 0, description: desc.slice(0, 255), establishmentId: null });
+    }
+  }
+
+  // 4) Dr vat_credit por el IVA (crédito tributario) — solo si la org puede usarlo; por defecto sí
+  const totalVat = p.lines.reduce((sum, l) => sum + asCents(l.vatCents), 0);
+  if (totalVat > 0) lines.push({ role: 'vat_credit', debitCents: totalVat, creditCents: 0, establishmentId: est });
+
+  // 5) purchase_price_variance por líneas stock con priceVarianceCents ≠ 0 (override aprobado)
+  for (const line of p.lines) {
+    if (line.kind !== 'stock') continue;
+    const pv = asCents(line.priceVarianceCents);
+    if (pv === 0) continue;
+    // Dr si factura costó más (pv > 0), Cr si costó menos (pv < 0)
+    if (pv > 0) {
+      lines.push({ role: 'purchase_price_variance', debitCents: pv, creditCents: 0, establishmentId: est });
+    } else {
+      lines.push({ role: 'purchase_price_variance', debitCents: 0, creditCents: -pv, establishmentId: est });
+    }
+  }
+
+  const number = p.internalNumber ?? p.billId;
+  const supplierName = p.supplier?.legalName ?? '';
+
+  // Guardia de cuadre: si algo no suma, mejor un pendiente visible que un asiento descuadrado.
+  const debitTotal = lines.reduce((sum, l) => sum + asCents(l.debitCents), 0);
+  const creditTotal = lines.reduce((sum, l) => sum + asCents(l.creditCents), 0);
+  if (debitTotal !== creditTotal) {
+    return blocked('UNBALANCED_SOURCE', `El asiento de la factura de compra no cuadra: débitos ${debitTotal} ≠ créditos ${creditTotal} en centavos.`);
+  }
+
+  return {
+    kind: 'draft',
+    entryDate: localDateOf(p.issueDate ?? ctx.now, ctx.timeZone),
+    description: `Factura de compra ${number}${supplierName ? ` — ${supplierName}` : ''}`.slice(0, 255),
+    reference: String(number).slice(0, 60),
+    sourceType,
+    sourceId: p.billId,
+    currencyCode: ctx.baseCurrency,
+    lines,
+  };
+}
+
+// ── Liquidación de compra autorizada (fiscal.ec.purchase_settlement.issued) ───
+
+/**
+ * Liquidación de compra autorizada (codDoc 03): mismo asiento que una factura de compra.
+ * Para no duplicar con purchasing.bill.posted de una liquidación: el asiento nace de ESTE evento
+ * (autorizado = existe legalmente) y purchasing.bill.posted ignora docType '03'.
+ */
+export function draftFromPurchaseSettlementIssued(p: PurchaseSettlementIssuedPayload, ctx: RuleContext): PostingRuleResult {
+  const sourceType = 'purchase_settlement';
+  const blocked = (reasonCode: string, message: string): PostingBlocked => ({ kind: 'blocked', reasonCode, message, sourceType, sourceId: p.documentId });
+
+  if ((p.currencyCode ?? ctx.baseCurrency) !== ctx.baseCurrency) {
+    return blocked('CURRENCY_MISMATCH', `La liquidación está en ${p.currencyCode} y la contabilidad lleva ${ctx.baseCurrency}.`);
+  }
+  const total = asCents(p.totalCents);
+  if (total <= 0) return { kind: 'skip', reason: 'liquidación sin importe' };
+
+  const linesSubtotal = p.lines.reduce((sum, l) => sum + asCents(l.subtotalCents), 0);
+  const linesTax = p.lines.reduce((sum, l) => sum + asCents(l.vatCents) + asCents(l.iceCents) + asCents(l.irbpnrCents), 0);
+  if (Math.abs(total - (linesSubtotal + linesTax)) > 1) {
+    return blocked('UNBALANCED_SOURCE', `Total liquidación (${total}) ≠ subtotal+impuestos (${linesSubtotal + linesTax}) en centavos.`);
+  }
+
+  const est = p.establishmentId ?? null;
+  const party = { partyType: 'supplier' as const, partyId: p.supplierId };
+
+  const lines: DraftLine[] = [];
+
+  // 1) Cr payables por el TOTAL
+  lines.push({ role: 'payables', debitCents: 0, creditCents: total, establishmentId: est, ...party });
+
+  // 2) Dr inventory por líneas stock (subtotal + ICE/IRBPNR; IVA NO al costo). Igual que en la factura
+  //    de compra: el inventario va al costo estándar y la variación de precio aparte.
+  let inventorySubtotal = 0;
+  for (const line of p.lines) {
+    if (line.kind !== 'stock') continue;
+    const lineCost = asCents(line.subtotalCents) + asCents(line.iceCents) + asCents(line.irbpnrCents);
+    const toInventory = lineCost - asCents(line.priceVarianceCents);
+    if (toInventory > 0) inventorySubtotal += toInventory;
+  }
+  if (inventorySubtotal > 0) lines.push({ role: 'inventory', debitCents: inventorySubtotal, creditCents: 0, establishmentId: est });
+
+  // 3) Dr other_expense por líneas expense
+  for (const line of p.lines) {
+    if (line.kind !== 'expense') continue;
+    const expSub = asCents(line.subtotalCents);
+    const expIce = asCents(line.iceCents);
+    const expIrbpnr = asCents(line.irbpnrCents);
+    const expCost = expSub + expIce + expIrbpnr;
+    if (expCost > 0) {
+      const desc = line.expenseAccountHint ? ` (cuenta sugerida: ${line.expenseAccountHint})` : '';
+      lines.push({ role: 'other_expense', debitCents: expCost, creditCents: 0, description: desc.slice(0, 255), establishmentId: null });
+    }
+  }
+
+  // 4) Dr vat_credit por el IVA
+  const totalVat = p.lines.reduce((sum, l) => sum + asCents(l.vatCents), 0);
+  if (totalVat > 0) lines.push({ role: 'vat_credit', debitCents: totalVat, creditCents: 0, establishmentId: est });
+
+  // 5) purchase_price_variance
+  for (const line of p.lines) {
+    if (line.kind !== 'stock') continue;
+    const pv = asCents(line.priceVarianceCents);
+    if (pv === 0) continue;
+    if (pv > 0) {
+      lines.push({ role: 'purchase_price_variance', debitCents: pv, creditCents: 0, establishmentId: est });
+    } else {
+      lines.push({ role: 'purchase_price_variance', debitCents: 0, creditCents: -pv, establishmentId: est });
+    }
+  }
+
+  const number = p.internalNumber ?? p.documentId;
+  const supplierName = p.supplier?.legalName ?? '';
+
+  // Guardia de cuadre, igual que en la factura de compra.
+  const debitTotal = lines.reduce((sum, l) => sum + asCents(l.debitCents), 0);
+  const creditTotal = lines.reduce((sum, l) => sum + asCents(l.creditCents), 0);
+  if (debitTotal !== creditTotal) {
+    return blocked('UNBALANCED_SOURCE', `El asiento de la liquidación no cuadra: débitos ${debitTotal} ≠ créditos ${creditTotal} en centavos.`);
+  }
+
+  return {
+    kind: 'draft',
+    entryDate: localDateOf(p.issueDate ?? ctx.now, ctx.timeZone),
+    description: `Liquidación de compra ${number}${supplierName ? ` — ${supplierName}` : ''}`.slice(0, 255),
+    reference: String(number).slice(0, 60),
+    sourceType,
+    sourceId: p.documentId,
+    currencyCode: ctx.baseCurrency,
+    lines,
   };
 }

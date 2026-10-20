@@ -3,11 +3,15 @@ import { AppError } from '../../domain/errors.js';
 import { JournalEntry, type JournalLineInput } from '../../domain/journal.js';
 import {
   draftFromInvoiceIssued,
+  draftFromPurchaseBillPosted,
+  draftFromPurchaseSettlementIssued,
   draftFromStockMovement,
   draftFromWithholdingIssued,
   localDateOf,
   type InvoiceIssuedPayload,
   type PostingDraft,
+  type PurchaseBillPostedPayload,
+  type PurchaseSettlementIssuedPayload,
   type RuleContext,
   type StockMovementPayload,
   type WithholdingIssuedPayload,
@@ -26,6 +30,9 @@ export const POSTING_EVENT_TYPES = [
   'inventory.stock.entered',
   'inventory.stock.adjusted',
   'fiscal.ec.withholding.issued',
+  'purchasing.bill.posted',
+  'purchasing.bill.voided',
+  'fiscal.ec.purchase_settlement.issued',
 ] as const;
 
 export const GENERAL_LEDGER_PLUGIN = 'finance.general_ledger';
@@ -121,13 +128,18 @@ export class AutomaticPostingUseCase {
     const ctx = ruleContext(settings, now);
 
     if (eventType === 'billing.invoice.voided') return this.runVoid(uow, settings, payload, ctx);
+    if (eventType === 'purchasing.bill.voided') return this.runVoidPurchaseBill(uow, settings, payload, ctx);
 
     const rule =
       eventType === 'billing.invoice.issued'
         ? draftFromInvoiceIssued(payload as unknown as InvoiceIssuedPayload, ctx)
         : eventType === 'fiscal.ec.withholding.issued'
           ? draftFromWithholdingIssued(payload as unknown as WithholdingIssuedPayload, ctx)
-          : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
+          : eventType === 'purchasing.bill.posted'
+            ? draftFromPurchaseBillPosted(payload as unknown as PurchaseBillPostedPayload, ctx)
+            : eventType === 'fiscal.ec.purchase_settlement.issued'
+              ? draftFromPurchaseSettlementIssued(payload as unknown as PurchaseSettlementIssuedPayload, ctx)
+              : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
 
     if (rule.kind === 'skip') return { result: { outcome: 'skipped', reason: rule.reason }, commit: false };
     if (rule.kind === 'blocked') {
@@ -267,6 +279,78 @@ export class AutomaticPostingUseCase {
         createdBy: this.systemUserId,
         sourceType: 'invoice',
         sourceId: invoiceId,
+      });
+      await uow.journal.save(reversal);
+      await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());
+      locked.markReversed(reversal.id);
+      await uow.journal.save(locked);
+      await uow.outbox.add(journalEntryReversedEvent(locked, reversal));
+      return { result: { outcome: 'posted', entryId: reversal.id }, commit: true };
+    } catch (err) {
+      if (err instanceof AppError) return pending(err.code, err.message);
+      throw err;
+    }
+  }
+
+  /** Anulación de una factura de compra: reversa del asiento de la factura (misma lógica que billing.invoice.voided). */
+  private async runVoidPurchaseBill(uow: WriteUnitOfWork, settings: AccountingSettings, payload: Record<string, unknown>, ctx: RuleContext): Promise<Step> {
+    const organizationId = settings.organizationId;
+    const billId = typeof payload.billId === 'string' ? payload.billId : null;
+    if (!billId) return { result: { outcome: 'ignored', reason: 'anulación sin factura de compra' }, commit: false };
+
+    const original = await uow.journal.findBySource(organizationId, 'purchase_bill', billId, 'automatic');
+    if (!original) {
+      // Se anuló antes de contabilizarse (estaba pendiente) o es anterior a la contabilidad.
+      const waiting = await uow.pendingPostings.findBySource(organizationId, 'purchasing.bill.posted', 'purchase_bill', billId);
+      if (waiting && waiting.status === 'pending') {
+        waiting.status = 'discarded';
+        waiting.reasonMessage = 'La factura de compra se anuló antes de contabilizarse.';
+        waiting.resolvedAt = this.clock();
+        waiting.updatedAt = waiting.resolvedAt;
+        await uow.pendingPostings.save(waiting);
+        await uow.outbox.add(postingResolvedEvent(waiting, 'discarded', waiting.reasonMessage));
+        return { result: { outcome: 'ignored', reason: 'anulada antes de contabilizarse' }, commit: true };
+      }
+      const issuedOn = typeof payload.issueDate === 'string' ? localDateOf(payload.issueDate, ctx.timeZone) : null;
+      if (issuedOn && settings.autoPostingFrom && issuedOn < settings.autoPostingFrom) {
+        return { result: { outcome: 'ignored', reason: `factura anterior al ${settings.autoPostingFrom}` }, commit: false };
+      }
+      return {
+        result: {
+          outcome: 'pending',
+          reasonCode: 'ORIGINAL_NOT_POSTED',
+          message: 'La factura de compra todavía no tiene asiento: se reversará cuando se contabilice.',
+          sourceType: 'purchase_bill_void',
+          sourceId: billId,
+          entryDate: localDateOf(typeof payload.voidedAt === 'string' ? payload.voidedAt : ctx.now, ctx.timeZone),
+        },
+        commit: false,
+      };
+    }
+    const already = await uow.journal.findBySource(organizationId, 'purchase_bill', billId, 'reversal');
+    if (already) return { result: { outcome: 'duplicate', entryId: already.id }, commit: false };
+
+    const voidedAt = typeof payload.voidedAt === 'string' ? payload.voidedAt : ctx.now;
+    const entryDate = localDateOf(voidedAt, ctx.timeZone);
+    const pending = (code: string, message: string): Step => ({
+      result: { outcome: 'pending', reasonCode: code, message, sourceType: 'purchase_bill_void', sourceId: billId, entryDate },
+      commit: false,
+    });
+    if (!settings.autoPosting) return pending('AUTO_POSTING_OFF', 'La contabilización automática está apagada.');
+
+    const locked = await uow.journal.lockById(organizationId, original.id);
+    if (!locked) return { result: { outcome: 'ignored', reason: 'el asiento original ya no existe' }, commit: false };
+    if (locked.reversedByEntryId) return { result: { outcome: 'duplicate', entryId: locked.reversedByEntryId }, commit: false };
+    try {
+      // purchasing.bill.voided trae `internalNumber` (FC-AAAA-NNNNNN) y el motivo de la anulación en `voidReason`.
+      const number = typeof payload.internalNumber === 'string' ? payload.internalNumber : typeof payload.number === 'string' ? payload.number : billId;
+      const why = typeof payload.voidReason === 'string' && payload.voidReason ? `: ${payload.voidReason}` : '';
+      const reversal = JournalEntry.reversalOf(locked, {
+        entryDate,
+        reason: `Anulación de factura de compra ${number}${why}`.slice(0, 255),
+        createdBy: this.systemUserId,
+        sourceType: 'purchase_bill',
+        sourceId: billId,
       });
       await uow.journal.save(reversal);
       await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());
