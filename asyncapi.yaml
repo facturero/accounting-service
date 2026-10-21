@@ -56,6 +56,25 @@ channels:
         Para no duplicar con purchasing.bill.posted (que ignora docType 03): el asiento nace de ESTE evento (autorizado = existe legalmente).
         Mismo asiento: Cr proveedores / Dr inventario/gasto + IVA crédito + price_variance si aplica.
 
+  treasury.receipt.posted:
+    subscribe:
+      summary: Cobro a un cliente contabilizado (tesorería) → Dr caja/bancos y anticipos usados / Cr cuentas por cobrar y anticipo nuevo
+      description: >-
+        Dr `cash` o `bank` (según `accountRole`) por `totalCents`; Dr `customer_advances` por `advanceUsedCents` (anticipos anteriores que
+        el cobro consume); Cr `receivables` por `appliedCents`, con el cliente como tercero; Cr `customer_advances` por `advanceCents`
+        (excedente, con el cliente como tercero). Exige `totalCents + advanceUsedCents = appliedCents + advanceCents`: si no cuadra, queda
+        pendiente `UNBALANCED_SOURCE`. Moneda ≠ base → `CURRENCY_MISMATCH`. `receiptDate` es una fecha de calendario `AAAA-MM-DD`: no se
+        convierte por UTC. Sin la cuenta de un rol → pendiente `MISSING_ROLE` (no se inventa una cuenta). Idempotente por `sourceType=receipt`.
+        La factura no se asienta otra vez: su asiento lo hizo `billing.invoice.issued`.
+
+  treasury.receipt.voided:
+    subscribe:
+      summary: Cobro anulado (tesorería) → reversa del asiento del cobro
+      description: >-
+        Reversa el asiento automático del cobro, con el motivo en la descripción. Si el cobro todavía no tenía asiento (estaba pendiente),
+        descarta el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa
+        al contabilizarse.
+
   plugin.activated:
     subscribe:
       summary: Si el código es `finance.general_ledger`, enciende la contabilización automática

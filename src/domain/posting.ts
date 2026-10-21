@@ -603,3 +603,80 @@ export function draftFromPurchaseSettlementIssued(p: PurchaseSettlementIssuedPay
     lines,
   };
 }
+
+// ── Cobros a clientes (tesorería) ───────────────────────────────────────────
+
+/** Payload de `treasury.receipt.posted`: lo que entró, lo que se aplicó y a dónde. Importes en centavos; `receiptDate` es `AAAA-MM-DD`. */
+export interface ReceiptPostedPayload {
+  receiptId: string;
+  number?: string | null;
+  receiptDate: string;
+  customerId?: string | null;
+  customerName?: string | null;
+  currencyCode?: string;
+  /** Rol contable que recibe el dinero. */
+  accountRole?: string;
+  /** Lo que entró a caja o banco. */
+  totalCents: number;
+  /** De anticipos anteriores del cliente que el cobro consume (no entra dinero). */
+  advanceUsedCents?: number;
+  /** Lo aplicado a deudas. */
+  appliedCents: number;
+  /** Excedente: queda como anticipo nuevo del cliente. */
+  advanceCents?: number;
+  establishmentId?: string | null;
+}
+
+/**
+ * Cobro a un cliente contabilizado por tesorería:
+ *
+ *     Dr Caja o Bancos (según `accountRole`)       lo que entró
+ *     Dr Anticipos de clientes                     lo que se consume de anticipos anteriores
+ *     Cr Cuentas por cobrar (cliente)              lo aplicado a deudas
+ *     Cr Anticipos de clientes (cliente)           el excedente
+ *
+ * El dinero que entra y los anticipos que se consumen suman lo mismo que lo aplicado y el excedente (la igualdad la fija un CHECK en
+ * tesorería): si el evento llegara descuadrado se aparta como pendiente en vez de asentarse mal. El cliente va como tercero en las
+ * líneas de cuentas por cobrar y de anticipos: es lo que permite cuadrar el submayor de tesorería con el libro mayor POR CLIENTE.
+ * La factura NO se asienta otra vez: su asiento lo hizo `billing.invoice.issued`.
+ */
+export function draftFromReceiptPosted(p: ReceiptPostedPayload, ctx: RuleContext): PostingRuleResult {
+  const sourceType = 'receipt';
+  const blocked = (reasonCode: string, message: string): PostingBlocked => ({ kind: 'blocked', reasonCode, message, sourceType, sourceId: p.receiptId });
+
+  if ((p.currencyCode ?? ctx.baseCurrency) !== ctx.baseCurrency) {
+    return blocked('CURRENCY_MISMATCH', `El cobro está en ${p.currencyCode} y la contabilidad lleva ${ctx.baseCurrency}.`);
+  }
+  const cash = asCents(p.totalCents);
+  const used = asCents(p.advanceUsedCents);
+  const applied = asCents(p.appliedCents);
+  const advance = asCents(p.advanceCents);
+  if (cash + used <= 0) return { kind: 'skip', reason: 'cobro sin importe' };
+  if (cash + used !== applied + advance) {
+    return blocked('UNBALANCED_SOURCE', `Lo cobrado más los anticipos (${cash + used}) no coincide con lo aplicado más el excedente (${applied + advance}), en centavos.`);
+  }
+  const role = p.accountRole ?? 'cash';
+  if (role !== 'cash' && role !== 'bank') return blocked('UNMAPPED_COLLECTION_ROLE', `El cobro llega a «${role}», que no es caja ni bancos.`);
+
+  const party = p.customerId ? { partyType: 'customer' as const, partyId: p.customerId } : {};
+  const est = p.establishmentId ?? null;
+  const lines: DraftLine[] = [];
+  if (cash > 0) lines.push({ role, debitCents: cash, creditCents: 0, establishmentId: est });
+  if (used > 0) lines.push({ role: 'customer_advances', debitCents: used, creditCents: 0, establishmentId: est, ...party });
+  if (applied > 0) lines.push({ role: 'receivables', debitCents: 0, creditCents: applied, establishmentId: est, ...party });
+  if (advance > 0) lines.push({ role: 'customer_advances', debitCents: 0, creditCents: advance, establishmentId: est, ...party });
+
+  const number = p.number ?? p.receiptId;
+  const customer = p.customerName ?? '';
+  return {
+    kind: 'draft',
+    // `receiptDate` ya es una fecha de calendario: NO se convierte por UTC (en Guayaquil saldría el día anterior y no se asentaría).
+    entryDate: localDateOf(p.receiptDate ?? ctx.now, ctx.timeZone),
+    description: `Cobro ${number}${customer ? ` — ${customer}` : ''}`.slice(0, 255),
+    reference: String(number).slice(0, 60),
+    sourceType,
+    sourceId: p.receiptId,
+    currencyCode: ctx.baseCurrency,
+    lines,
+  };
+}
