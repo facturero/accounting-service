@@ -75,6 +75,24 @@ channels:
         descarta el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa
         al contabilizarse.
 
+  treasury.payment.posted:
+    subscribe:
+      summary: 'Pago a un proveedor contabilizado (tesorería) → Dr proveedores y anticipo a proveedores / Cr caja o bancos y anticipos consumidos'
+      description: >-
+        Dr `payables` por `appliedCents` y Dr `supplier_advances` por `advanceCents` (excedente), ambos con el proveedor como tercero; Cr `cash` o
+        `bank` (según `accountRole`) por `totalCents`; Cr `supplier_advances` por `advanceUsedCents` (anticipos anteriores que el pago consume).
+        Exige `totalCents + advanceUsedCents = appliedCents + advanceCents`: si no cuadra, queda pendiente `UNBALANCED_SOURCE`. Moneda ≠ base →
+        `CURRENCY_MISMATCH`. `paymentDate` es una fecha de calendario `AAAA-MM-DD`: no se convierte por UTC. Sin la cuenta de un rol →
+        pendiente `MISSING_ROLE`. Idempotente por `sourceType=payment`. La factura de compra no se asienta otra vez: su asiento lo hizo
+        `purchasing.bill.posted`.
+
+  treasury.payment.voided:
+    subscribe:
+      summary: Pago anulado (tesorería) → reversa del asiento del pago
+      description: >-
+        Reversa el asiento automático del pago, con el motivo en la descripción. Si el pago todavía no tenía asiento (estaba pendiente), descarta
+        el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa al contabilizarse.
+
   plugin.activated:
     subscribe:
       summary: Si el código es `finance.general_ledger`, enciende la contabilización automática

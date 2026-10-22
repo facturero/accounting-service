@@ -5,6 +5,7 @@ import {
   draftFromInvoiceIssued,
   draftFromPurchaseBillPosted,
   draftFromPurchaseSettlementIssued,
+  draftFromPaymentPosted,
   draftFromReceiptPosted,
   draftFromStockMovement,
   draftFromWithholdingIssued,
@@ -13,6 +14,7 @@ import {
   type PostingDraft,
   type PurchaseBillPostedPayload,
   type PurchaseSettlementIssuedPayload,
+  type PaymentPostedPayload,
   type ReceiptPostedPayload,
   type RuleContext,
   type StockMovementPayload,
@@ -37,6 +39,8 @@ export const POSTING_EVENT_TYPES = [
   'fiscal.ec.purchase_settlement.issued',
   'treasury.receipt.posted',
   'treasury.receipt.voided',
+  'treasury.payment.posted',
+  'treasury.payment.voided',
 ] as const;
 
 export const GENERAL_LEDGER_PLUGIN = 'finance.general_ledger';
@@ -93,6 +97,8 @@ export class AutomaticPostingUseCase {
       await this.resolveWaitingVoid(organizationId, p.invoiceId);
     } else if (result.outcome === 'posted' && eventType === 'treasury.receipt.posted' && typeof p.receiptId === 'string') {
       await this.resolveWaitingReceiptVoid(organizationId, p.receiptId);
+    } else if (result.outcome === 'posted' && eventType === 'treasury.payment.posted' && typeof p.paymentId === 'string') {
+      await this.resolveWaitingPaymentVoid(organizationId, p.paymentId);
     }
     return result;
   }
@@ -117,6 +123,20 @@ export class AutomaticPostingUseCase {
     let waiting: PendingPosting | null;
     try {
       waiting = await uow.pendingPostings.findBySource(organizationId, 'treasury.receipt.voided', 'receipt_void', receiptId);
+      await uow.commit();
+    } catch (err) {
+      await uow.rollback();
+      throw err;
+    }
+    if (waiting && waiting.status === 'pending') await this.retry(organizationId, [waiting.id]);
+  }
+
+  /** La anulación del pago llegó antes que su contabilización: ahora que el asiento existe, se reversa. */
+  private async resolveWaitingPaymentVoid(organizationId: string, paymentId: string): Promise<void> {
+    const uow = await this.gateway.begin();
+    let waiting: PendingPosting | null;
+    try {
+      waiting = await uow.pendingPostings.findBySource(organizationId, 'treasury.payment.voided', 'payment_void', paymentId);
       await uow.commit();
     } catch (err) {
       await uow.rollback();
@@ -150,6 +170,7 @@ export class AutomaticPostingUseCase {
     if (eventType === 'billing.invoice.voided') return this.runVoid(uow, settings, payload, ctx);
     if (eventType === 'purchasing.bill.voided') return this.runVoidPurchaseBill(uow, settings, payload, ctx);
     if (eventType === 'treasury.receipt.voided') return this.runVoidReceipt(uow, settings, payload, ctx);
+    if (eventType === 'treasury.payment.voided') return this.runVoidPayment(uow, settings, payload, ctx);
 
     const rule =
       eventType === 'billing.invoice.issued'
@@ -162,7 +183,9 @@ export class AutomaticPostingUseCase {
               ? draftFromPurchaseSettlementIssued(payload as unknown as PurchaseSettlementIssuedPayload, ctx)
               : eventType === 'treasury.receipt.posted'
                 ? draftFromReceiptPosted(payload as unknown as ReceiptPostedPayload, ctx)
-                : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
+                : eventType === 'treasury.payment.posted'
+                  ? draftFromPaymentPosted(payload as unknown as PaymentPostedPayload, ctx)
+                  : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
 
     if (rule.kind === 'skip') return { result: { outcome: 'skipped', reason: rule.reason }, commit: false };
     if (rule.kind === 'blocked') {
@@ -444,6 +467,76 @@ export class AutomaticPostingUseCase {
         createdBy: this.systemUserId,
         sourceType: 'receipt',
         sourceId: receiptId,
+      });
+      await uow.journal.save(reversal);
+      await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());
+      locked.markReversed(reversal.id);
+      await uow.journal.save(locked);
+      await uow.outbox.add(journalEntryReversedEvent(locked, reversal));
+      return { result: { outcome: 'posted', entryId: reversal.id }, commit: true };
+    } catch (err) {
+      if (err instanceof AppError) return pending(err.code, err.message);
+      throw err;
+    }
+  }
+
+  /** Anulación de un pago: reversa del asiento del pago (misma lógica que el cobro anulado). */
+  private async runVoidPayment(uow: WriteUnitOfWork, settings: AccountingSettings, payload: Record<string, unknown>, ctx: RuleContext): Promise<Step> {
+    const organizationId = settings.organizationId;
+    const paymentId = typeof payload.paymentId === 'string' ? payload.paymentId : null;
+    if (!paymentId) return { result: { outcome: 'ignored', reason: 'anulación sin pago' }, commit: false };
+
+    const original = await uow.journal.findBySource(organizationId, 'payment', paymentId, 'automatic');
+    if (!original) {
+      // Se anuló antes de contabilizarse (estaba pendiente) o es anterior a la contabilidad.
+      const waiting = await uow.pendingPostings.findBySource(organizationId, 'treasury.payment.posted', 'payment', paymentId);
+      if (waiting && waiting.status === 'pending') {
+        waiting.status = 'discarded';
+        waiting.reasonMessage = 'El pago se anuló antes de contabilizarse.';
+        waiting.resolvedAt = this.clock();
+        waiting.updatedAt = waiting.resolvedAt;
+        await uow.pendingPostings.save(waiting);
+        await uow.outbox.add(postingResolvedEvent(waiting, 'discarded', waiting.reasonMessage));
+        return { result: { outcome: 'ignored', reason: 'anulado antes de contabilizarse' }, commit: true };
+      }
+      const paidOn = typeof payload.paymentDate === 'string' ? localDateOf(payload.paymentDate, ctx.timeZone) : null;
+      if (paidOn && settings.autoPostingFrom && paidOn < settings.autoPostingFrom) {
+        return { result: { outcome: 'ignored', reason: `pago anterior al ${settings.autoPostingFrom}` }, commit: false };
+      }
+      return {
+        result: {
+          outcome: 'pending',
+          reasonCode: 'ORIGINAL_NOT_POSTED',
+          message: 'El pago todavía no tiene asiento: se reversará cuando se contabilice.',
+          sourceType: 'payment_void',
+          sourceId: paymentId,
+          entryDate: localDateOf(typeof payload.voidedAt === 'string' ? payload.voidedAt : ctx.now, ctx.timeZone),
+        },
+        commit: false,
+      };
+    }
+    const already = await uow.journal.findBySource(organizationId, 'payment', paymentId, 'reversal');
+    if (already) return { result: { outcome: 'duplicate', entryId: already.id }, commit: false };
+
+    const entryDate = localDateOf(typeof payload.voidedAt === 'string' ? payload.voidedAt : ctx.now, ctx.timeZone);
+    const pending = (code: string, message: string): Step => ({
+      result: { outcome: 'pending', reasonCode: code, message, sourceType: 'payment_void', sourceId: paymentId, entryDate },
+      commit: false,
+    });
+    if (!settings.autoPosting) return pending('AUTO_POSTING_OFF', 'La contabilización automática está apagada.');
+
+    const locked = await uow.journal.lockById(organizationId, original.id);
+    if (!locked) return { result: { outcome: 'ignored', reason: 'el asiento original ya no existe' }, commit: false };
+    if (locked.reversedByEntryId) return { result: { outcome: 'duplicate', entryId: locked.reversedByEntryId }, commit: false };
+    try {
+      const number = typeof payload.number === 'string' ? payload.number : paymentId;
+      const why = typeof payload.reason === 'string' && payload.reason ? `: ${payload.reason}` : '';
+      const reversal = JournalEntry.reversalOf(locked, {
+        entryDate,
+        reason: `Anulación del pago ${number}${why}`.slice(0, 255),
+        createdBy: this.systemUserId,
+        sourceType: 'payment',
+        sourceId: paymentId,
       });
       await uow.journal.save(reversal);
       await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());

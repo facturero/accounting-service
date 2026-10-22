@@ -680,3 +680,80 @@ export function draftFromReceiptPosted(p: ReceiptPostedPayload, ctx: RuleContext
     lines,
   };
 }
+
+// ── Pagos a proveedores (tesorería) ─────────────────────────────────────────
+
+/** Payload de `treasury.payment.posted`: lo que salió, lo que se aplicó y de dónde. Importes en centavos; `paymentDate` es `AAAA-MM-DD`. */
+export interface PaymentPostedPayload {
+  paymentId: string;
+  number?: string | null;
+  paymentDate: string;
+  supplierId?: string | null;
+  supplierName?: string | null;
+  currencyCode?: string;
+  /** Rol contable de donde sale el dinero. */
+  accountRole?: string;
+  /** Lo que salió de caja o banco. */
+  totalCents: number;
+  /** De anticipos anteriores a proveedores que el pago consume (no sale dinero). */
+  advanceUsedCents?: number;
+  /** Lo aplicado a facturas. */
+  appliedCents: number;
+  /** Excedente: queda como anticipo a proveedores. */
+  advanceCents?: number;
+  establishmentId?: string | null;
+}
+
+/**
+ * Pago a un proveedor contabilizado por tesorería (espejo del cobro):
+ *
+ *     Dr Proveedores (proveedor)                 lo aplicado a facturas
+ *     Dr Anticipos a proveedores (proveedor)     el excedente
+ *     Cr Caja o Bancos (según `accountRole`)     lo que salió
+ *     Cr Anticipos a proveedores (proveedor)     lo que se consume de anticipos anteriores
+ *
+ * El dinero que sale y los anticipos que se consumen suman lo mismo que lo aplicado y el excedente (la igualdad la fija un CHECK en
+ * tesorería): si el evento llegara descuadrado se aparta como pendiente en vez de asentarse mal. El proveedor va como tercero en las líneas
+ * de proveedores y de anticipos: es lo que permite cuadrar el submayor de tesorería con el libro mayor POR PROVEEDOR. La factura de compra
+ * NO se asienta otra vez: su asiento lo hizo `purchasing.bill.posted`.
+ */
+export function draftFromPaymentPosted(p: PaymentPostedPayload, ctx: RuleContext): PostingRuleResult {
+  const sourceType = 'payment';
+  const blocked = (reasonCode: string, message: string): PostingBlocked => ({ kind: 'blocked', reasonCode, message, sourceType, sourceId: p.paymentId });
+
+  if ((p.currencyCode ?? ctx.baseCurrency) !== ctx.baseCurrency) {
+    return blocked('CURRENCY_MISMATCH', `El pago está en ${p.currencyCode} y la contabilidad lleva ${ctx.baseCurrency}.`);
+  }
+  const cash = asCents(p.totalCents);
+  const used = asCents(p.advanceUsedCents);
+  const applied = asCents(p.appliedCents);
+  const advance = asCents(p.advanceCents);
+  if (cash + used <= 0) return { kind: 'skip', reason: 'pago sin importe' };
+  if (cash + used !== applied + advance) {
+    return blocked('UNBALANCED_SOURCE', `Lo pagado más los anticipos (${cash + used}) no coincide con lo aplicado más el excedente (${applied + advance}), en centavos.`);
+  }
+  const role = p.accountRole ?? 'bank';
+  if (role !== 'cash' && role !== 'bank') return blocked('UNMAPPED_COLLECTION_ROLE', `El pago sale de «${role}», que no es caja ni bancos.`);
+
+  const party = p.supplierId ? { partyType: 'supplier' as const, partyId: p.supplierId } : {};
+  const est = p.establishmentId ?? null;
+  const lines: DraftLine[] = [];
+  if (applied > 0) lines.push({ role: 'payables', debitCents: applied, creditCents: 0, establishmentId: est, ...party });
+  if (advance > 0) lines.push({ role: 'supplier_advances', debitCents: advance, creditCents: 0, establishmentId: est, ...party });
+  if (cash > 0) lines.push({ role, debitCents: 0, creditCents: cash, establishmentId: est });
+  if (used > 0) lines.push({ role: 'supplier_advances', debitCents: 0, creditCents: used, establishmentId: est, ...party });
+
+  const number = p.number ?? p.paymentId;
+  const supplier = p.supplierName ?? '';
+  return {
+    kind: 'draft',
+    // `paymentDate` ya es una fecha de calendario: NO se convierte por UTC (en Guayaquil saldría el día anterior y no se asentaría).
+    entryDate: localDateOf(p.paymentDate ?? ctx.now, ctx.timeZone),
+    description: `Pago ${number}${supplier ? ` — ${supplier}` : ''}`.slice(0, 255),
+    reference: String(number).slice(0, 60),
+    sourceType,
+    sourceId: p.paymentId,
+    currencyCode: ctx.baseCurrency,
+    lines,
+  };
+}
