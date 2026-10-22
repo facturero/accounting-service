@@ -5,6 +5,7 @@ import {
   draftFromInvoiceIssued,
   draftFromPurchaseBillPosted,
   draftFromPurchaseSettlementIssued,
+  draftFromBankAdjustmentPosted,
   draftFromPaymentPosted,
   draftFromReceiptPosted,
   draftFromStockMovement,
@@ -14,6 +15,7 @@ import {
   type PostingDraft,
   type PurchaseBillPostedPayload,
   type PurchaseSettlementIssuedPayload,
+  type BankAdjustmentPostedPayload,
   type PaymentPostedPayload,
   type ReceiptPostedPayload,
   type RuleContext,
@@ -41,6 +43,8 @@ export const POSTING_EVENT_TYPES = [
   'treasury.receipt.voided',
   'treasury.payment.posted',
   'treasury.payment.voided',
+  'treasury.bank_adjustment.posted',
+  'treasury.bank_adjustment.voided',
 ] as const;
 
 export const GENERAL_LEDGER_PLUGIN = 'finance.general_ledger';
@@ -99,6 +103,8 @@ export class AutomaticPostingUseCase {
       await this.resolveWaitingReceiptVoid(organizationId, p.receiptId);
     } else if (result.outcome === 'posted' && eventType === 'treasury.payment.posted' && typeof p.paymentId === 'string') {
       await this.resolveWaitingPaymentVoid(organizationId, p.paymentId);
+    } else if (result.outcome === 'posted' && eventType === 'treasury.bank_adjustment.posted' && typeof p.adjustmentId === 'string') {
+      await this.resolveWaitingAdjustmentVoid(organizationId, p.adjustmentId);
     }
     return result;
   }
@@ -145,6 +151,20 @@ export class AutomaticPostingUseCase {
     if (waiting && waiting.status === 'pending') await this.retry(organizationId, [waiting.id]);
   }
 
+  /** La anulación del ajuste bancario llegó antes que su contabilización: ahora que el asiento existe, se reversa. */
+  private async resolveWaitingAdjustmentVoid(organizationId: string, adjustmentId: string): Promise<void> {
+    const uow = await this.gateway.begin();
+    let waiting: PendingPosting | null;
+    try {
+      waiting = await uow.pendingPostings.findBySource(organizationId, 'treasury.bank_adjustment.voided', 'bank_adjustment_void', adjustmentId);
+      await uow.commit();
+    } catch (err) {
+      await uow.rollback();
+      throw err;
+    }
+    if (waiting && waiting.status === 'pending') await this.retry(organizationId, [waiting.id]);
+  }
+
   /** Intenta contabilizar un evento. NO toca `pending_postings`: lo hacen `handle` y `retry`. */
   async process(organizationId: string, eventType: string, payload: Record<string, unknown>): Promise<ProcessResult> {
     const uow = await this.gateway.begin();
@@ -171,6 +191,7 @@ export class AutomaticPostingUseCase {
     if (eventType === 'purchasing.bill.voided') return this.runVoidPurchaseBill(uow, settings, payload, ctx);
     if (eventType === 'treasury.receipt.voided') return this.runVoidReceipt(uow, settings, payload, ctx);
     if (eventType === 'treasury.payment.voided') return this.runVoidPayment(uow, settings, payload, ctx);
+    if (eventType === 'treasury.bank_adjustment.voided') return this.runVoidBankAdjustment(uow, settings, payload, ctx);
 
     const rule =
       eventType === 'billing.invoice.issued'
@@ -185,7 +206,9 @@ export class AutomaticPostingUseCase {
                 ? draftFromReceiptPosted(payload as unknown as ReceiptPostedPayload, ctx)
                 : eventType === 'treasury.payment.posted'
                   ? draftFromPaymentPosted(payload as unknown as PaymentPostedPayload, ctx)
-                  : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
+                  : eventType === 'treasury.bank_adjustment.posted'
+                    ? draftFromBankAdjustmentPosted(payload as unknown as BankAdjustmentPostedPayload, ctx)
+                    : draftFromStockMovement(eventType, payload as unknown as StockMovementPayload, ctx);
 
     if (rule.kind === 'skip') return { result: { outcome: 'skipped', reason: rule.reason }, commit: false };
     if (rule.kind === 'blocked') {
@@ -537,6 +560,75 @@ export class AutomaticPostingUseCase {
         createdBy: this.systemUserId,
         sourceType: 'payment',
         sourceId: paymentId,
+      });
+      await uow.journal.save(reversal);
+      await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());
+      locked.markReversed(reversal.id);
+      await uow.journal.save(locked);
+      await uow.outbox.add(journalEntryReversedEvent(locked, reversal));
+      return { result: { outcome: 'posted', entryId: reversal.id }, commit: true };
+    } catch (err) {
+      if (err instanceof AppError) return pending(err.code, err.message);
+      throw err;
+    }
+  }
+
+  /** Anulación de un ajuste bancario: reversa del asiento del ajuste (misma lógica que el pago anulado). */
+  private async runVoidBankAdjustment(uow: WriteUnitOfWork, settings: AccountingSettings, payload: Record<string, unknown>, ctx: RuleContext): Promise<Step> {
+    const organizationId = settings.organizationId;
+    const adjustmentId = typeof payload.adjustmentId === 'string' ? payload.adjustmentId : null;
+    if (!adjustmentId) return { result: { outcome: 'ignored', reason: 'anulación sin ajuste' }, commit: false };
+
+    const original = await uow.journal.findBySource(organizationId, 'bank_adjustment', adjustmentId, 'automatic');
+    if (!original) {
+      // Se anuló antes de contabilizarse (estaba pendiente) o es anterior a la contabilidad.
+      const waiting = await uow.pendingPostings.findBySource(organizationId, 'treasury.bank_adjustment.posted', 'bank_adjustment', adjustmentId);
+      if (waiting && waiting.status === 'pending') {
+        waiting.status = 'discarded';
+        waiting.reasonMessage = 'El ajuste bancario se anuló antes de contabilizarse.';
+        waiting.resolvedAt = this.clock();
+        waiting.updatedAt = waiting.resolvedAt;
+        await uow.pendingPostings.save(waiting);
+        await uow.outbox.add(postingResolvedEvent(waiting, 'discarded', waiting.reasonMessage));
+        return { result: { outcome: 'ignored', reason: 'anulado antes de contabilizarse' }, commit: true };
+      }
+      const on = typeof payload.adjustmentDate === 'string' ? localDateOf(payload.adjustmentDate, ctx.timeZone) : null;
+      if (on && settings.autoPostingFrom && on < settings.autoPostingFrom) {
+        return { result: { outcome: 'ignored', reason: `ajuste anterior al ${settings.autoPostingFrom}` }, commit: false };
+      }
+      return {
+        result: {
+          outcome: 'pending',
+          reasonCode: 'ORIGINAL_NOT_POSTED',
+          message: 'El ajuste bancario todavía no tiene asiento: se reversará cuando se contabilice.',
+          sourceType: 'bank_adjustment_void',
+          sourceId: adjustmentId,
+          entryDate: localDateOf(ctx.now, ctx.timeZone),
+        },
+        commit: false,
+      };
+    }
+    const already = await uow.journal.findBySource(organizationId, 'bank_adjustment', adjustmentId, 'reversal');
+    if (already) return { result: { outcome: 'duplicate', entryId: already.id }, commit: false };
+
+    const entryDate = localDateOf(ctx.now, ctx.timeZone);
+    const pending = (code: string, message: string): Step => ({
+      result: { outcome: 'pending', reasonCode: code, message, sourceType: 'bank_adjustment_void', sourceId: adjustmentId, entryDate },
+      commit: false,
+    });
+    if (!settings.autoPosting) return pending('AUTO_POSTING_OFF', 'La contabilización automática está apagada.');
+
+    const locked = await uow.journal.lockById(organizationId, original.id);
+    if (!locked) return { result: { outcome: 'ignored', reason: 'el asiento original ya no existe' }, commit: false };
+    if (locked.reversedByEntryId) return { result: { outcome: 'duplicate', entryId: locked.reversedByEntryId }, commit: false };
+    try {
+      const why = typeof payload.reason === 'string' && payload.reason ? `: ${payload.reason}` : '';
+      const reversal = JournalEntry.reversalOf(locked, {
+        entryDate,
+        reason: `Anulación del ajuste bancario${why}`.slice(0, 255),
+        createdBy: this.systemUserId,
+        sourceType: 'bank_adjustment',
+        sourceId: adjustmentId,
       });
       await uow.journal.save(reversal);
       await postEntryInTransaction(uow, reversal, this.systemUserId, this.clock());

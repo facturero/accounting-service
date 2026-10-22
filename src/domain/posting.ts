@@ -757,3 +757,66 @@ export function draftFromPaymentPosted(p: PaymentPostedPayload, ctx: RuleContext
     lines,
   };
 }
+
+// ── Ajustes bancarios (tesorería, bloque E) ─────────────────────────────────
+
+/**
+ * Payload de `treasury.bank_adjustment.posted`: lo que el banco hizo y la empresa no tenía (comisión, interés, otro ingreso o egreso).
+ * `amountCents` es SIEMPRE positivo: el sentido lo da `direction`. `adjustmentDate` es una fecha de calendario `AAAA-MM-DD`.
+ */
+export interface BankAdjustmentPostedPayload {
+  adjustmentId: string;
+  bankAccountName?: string | null;
+  kind?: string | null;
+  direction: string;
+  amountCents: number;
+  currencyCode?: string;
+  adjustmentDate: string;
+  description?: string | null;
+  reference?: string | null;
+}
+
+/**
+ * Ajuste bancario contabilizado por tesorería:
+ *
+ *     egreso  (comisión, otro egreso):   Dr Otros gastos (`other_expense`)  /  Cr Bancos (`bank`)
+ *     ingreso (interés, otro ingreso):   Dr Bancos (`bank`)                 /  Cr Otros ingresos (`other_income`)
+ *
+ * Contabilidad resuelve `bank` a la única cuenta de ese rol: las cuentas bancarias de tesorería suman en esa misma cuenta del mayor.
+ */
+export function draftFromBankAdjustmentPosted(p: BankAdjustmentPostedPayload, ctx: RuleContext): PostingRuleResult {
+  const sourceType = 'bank_adjustment';
+  const blocked = (reasonCode: string, message: string): PostingBlocked => ({ kind: 'blocked', reasonCode, message, sourceType, sourceId: p.adjustmentId });
+
+  if ((p.currencyCode ?? ctx.baseCurrency) !== ctx.baseCurrency) {
+    return blocked('CURRENCY_MISMATCH', `El ajuste está en ${p.currencyCode} y la contabilidad lleva ${ctx.baseCurrency}.`);
+  }
+  const amount = asCents(p.amountCents);
+  if (amount <= 0) return { kind: 'skip', reason: 'ajuste sin importe' };
+  if (p.direction !== 'in' && p.direction !== 'out') {
+    return blocked('UNBALANCED_SOURCE', `El sentido del ajuste («${p.direction}») no es ni entrada ni salida: no se sabe qué lado del banco afecta.`);
+  }
+  const lines: DraftLine[] =
+    p.direction === 'out'
+      ? [
+          { role: 'other_expense', debitCents: amount, creditCents: 0, establishmentId: null },
+          { role: 'bank', debitCents: 0, creditCents: amount, establishmentId: null },
+        ]
+      : [
+          { role: 'bank', debitCents: amount, creditCents: 0, establishmentId: null },
+          { role: 'other_income', debitCents: 0, creditCents: amount, establishmentId: null },
+        ];
+  const detail = p.description?.trim() || p.kind || '';
+  const account = p.bankAccountName ? ` (${p.bankAccountName})` : '';
+  return {
+    kind: 'draft',
+    // `adjustmentDate` ya es una fecha de calendario: NO se convierte por UTC.
+    entryDate: localDateOf(p.adjustmentDate ?? ctx.now, ctx.timeZone),
+    description: `Ajuste bancario${account}${detail ? ` — ${detail}` : ''}`.slice(0, 255),
+    reference: (p.reference ?? p.adjustmentId).slice(0, 60),
+    sourceType,
+    sourceId: p.adjustmentId,
+    currencyCode: ctx.baseCurrency,
+    lines,
+  };
+}

@@ -93,6 +93,20 @@ channels:
         Reversa el asiento automático del pago, con el motivo en la descripción. Si el pago todavía no tenía asiento (estaba pendiente), descarta
         el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa al contabilizarse.
 
+  treasury.bank_adjustment.posted:
+    subscribe:
+      summary: Ajuste bancario (tesorería, bloque E) → asiento contra Bancos
+      description: >-
+        Comisión, interés u otro ingreso o egreso del banco que la empresa no tenía registrado. Egreso: Dr `other_expense` / Cr `bank`; ingreso:
+        Dr `bank` / Cr `other_income`, con `amountCents` positivo y `direction` (`in`|`out`) que da el sentido. La fecha del asiento es
+        `adjustmentDate` (fecha de calendario, sin conversión UTC). Idempotente por `sourceType=bank_adjustment` y `sourceId=adjustmentId`.
+        Sin cuenta de Bancos u Otros gastos/ingresos mapeada queda pendiente `MISSING_ROLE`.
+  treasury.bank_adjustment.voided:
+    subscribe:
+      summary: Ajuste bancario anulado (tesorería) → reversa del asiento
+      description: >-
+        Reversa el asiento automático del ajuste, con el motivo en la descripción. Si el ajuste todavía no tenía asiento (estaba pendiente),
+        descarta el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa al contabilizarse.
   plugin.activated:
     subscribe:
       summary: Si el código es `finance.general_ledger`, enciende la contabilización automática
