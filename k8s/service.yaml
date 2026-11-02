@@ -5,7 +5,10 @@ metadata:
   labels:
     app: accounting-service-node
 spec:
-  type: NodePort
+  # ClusterIP: este servicio confía en las cabeceras X-Organization-Id /
+  # X-Permissions que pone el gateway. Con NodePort cualquiera en la red del
+  # nodo podía llamarlo directo y hacerse pasar por cualquier organización.
+  type: ClusterIP
   selector:
     app: accounting-service-node
   ports:
