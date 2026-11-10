@@ -11,6 +11,7 @@ import {
   OutboxModel,
   PendingPostingModel,
   SettingsModel,
+  SourceProjectModel,
 } from './models.js';
 import { Account, CostCenter } from '../../domain/account.js';
 import { JournalEntry, type JournalLineProps } from '../../domain/journal.js';
@@ -29,6 +30,7 @@ import type {
   PeriodRepository,
   ReportRepository,
   SettingsRepository,
+  SourceProjectRepository,
   UnitOfWork,
 } from '../../domain/repositories.js';
 import type { WriteUnitOfWork } from '../../application/ports.js';
@@ -652,9 +654,10 @@ function reportRepository(tx?: Transaction): ReportRepository {
            FROM journal_lines
           WHERE organization_id = :org AND is_posted = 1 AND entry_date <= :to
             ${f.costCenterId ? 'AND cost_center_id = :cc' : ''}
+            ${f.projectId ? 'AND project_id = :project' : ''}
           GROUP BY account_id`,
         {
-          replacements: { org: organizationId, from: f.from, to: f.to, yearStart: f.yearStart, cc: f.costCenterId ?? null },
+          replacements: { org: organizationId, from: f.from, to: f.to, yearStart: f.yearStart, cc: f.costCenterId ?? null, project: f.projectId ?? null },
           type: QueryTypes.SELECT,
           transaction: tx,
         },
@@ -734,6 +737,27 @@ function reportRepository(tx?: Transaction): ReportRepository {
   };
 }
 
+function sourceProjectRepository(tx?: Transaction): SourceProjectRepository {
+  return {
+    async find(organizationId, sourceType, sourceId) {
+      const row = await SourceProjectModel.findOne({ where: { organization_id: organizationId, source_type: sourceType, source_id: sourceId }, transaction: tx });
+      return row?.project_id ?? null;
+    },
+    // Buscar y luego crear o actualizar, no `upsert` (ver persistence-guard.test.ts). Dos eventos del mismo documento a la vez
+    // (`linked` e `issued`) traen el mismo proyecto; si chocaran en el INSERT, el inbox reintenta y el segundo cae en el UPDATE.
+    async save(organizationId, sourceType, sourceId, projectId) {
+      const where = { organization_id: organizationId, source_type: sourceType, source_id: sourceId };
+      const now = new Date();
+      const existing = await SourceProjectModel.findOne({ where, transaction: tx, lock: tx ? Transaction.LOCK.UPDATE : undefined });
+      if (existing) {
+        if (existing.project_id !== projectId) await SourceProjectModel.update({ project_id: projectId, updated_at: now }, { where, transaction: tx });
+        return;
+      }
+      await SourceProjectModel.create({ ...where, project_id: projectId, created_at: now, updated_at: now }, { transaction: tx });
+    },
+  };
+}
+
 function outboxRepository(tx?: Transaction): OutboxRepository {
   return {
     async add(event: DomainEvent) {
@@ -765,6 +789,7 @@ export function buildRepositories(tx?: Transaction): UnitOfWork {
     journal: journalRepository(tx),
     reports: reportRepository(tx),
     pendingPostings: pendingPostingRepository(tx),
+    sourceProjects: sourceProjectRepository(tx),
     outbox: outboxRepository(tx),
   };
 }
@@ -780,6 +805,7 @@ export class SequelizeUnitOfWork implements WriteUnitOfWork {
   readonly journal;
   readonly reports;
   readonly pendingPostings;
+  readonly sourceProjects;
   readonly outbox;
 
   constructor(readonly tx: Transaction) {
@@ -791,6 +817,7 @@ export class SequelizeUnitOfWork implements WriteUnitOfWork {
     this.journal = repos.journal;
     this.reports = repos.reports;
     this.pendingPostings = repos.pendingPostings;
+    this.sourceProjects = repos.sourceProjects;
     this.outbox = repos.outbox;
   }
 

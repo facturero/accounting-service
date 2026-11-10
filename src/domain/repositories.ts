@@ -72,6 +72,15 @@ export interface PendingPostingRepository {
   save(row: PendingPosting): Promise<void>;
 }
 
+/**
+ * A qué proyecto pertenece un documento de otro servicio (hoy, las facturas creadas desde un proyecto), para contabilizarlo con esa
+ * dimensión. Lo alimentan los eventos de projects-service; se consulta al armar el asiento automático.
+ */
+export interface SourceProjectRepository {
+  find(organizationId: string, sourceType: string, sourceId: string): Promise<string | null>;
+  save(organizationId: string, sourceType: string, sourceId: string, projectId: string): Promise<void>;
+}
+
 export interface AccountListFilters {
   status?: EntityStatus;
   type?: string;
@@ -149,6 +158,7 @@ export interface SumFilters {
   to: LocalDate;
   yearStart: LocalDate;
   costCenterId?: string;
+  projectId?: string;
 }
 
 export interface LedgerQuery {
@@ -175,5 +185,6 @@ export interface UnitOfWork {
   journal: JournalRepository;
   reports: ReportRepository;
   pendingPostings: PendingPostingRepository;
+  sourceProjects: SourceProjectRepository;
   outbox: OutboxRepository;
 }

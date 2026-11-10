@@ -29,6 +29,7 @@ export class TrialBalanceUseCase {
     from: string;
     to: string;
     costCenterId?: string;
+    projectId?: string;
     includeZero?: boolean;
     maxLevel?: number;
   }): Promise<TrialBalance> {
@@ -36,7 +37,7 @@ export class TrialBalanceUseCase {
     const yearStart = await yearStartFor(this.repos, input.organizationId, input.from);
     const [accounts, sums] = await Promise.all([
       this.repos.accounts.list(input.organizationId),
-      this.repos.reports.sumByAccount(input.organizationId, { from: input.from, to: input.to, yearStart, costCenterId: input.costCenterId }),
+      this.repos.reports.sumByAccount(input.organizationId, { from: input.from, to: input.to, yearStart, costCenterId: input.costCenterId, projectId: input.projectId }),
     ]);
     return buildTrialBalance({ accounts, sums, from: input.from, to: input.to, includeZero: input.includeZero ?? false, maxLevel: input.maxLevel });
   }
@@ -75,7 +76,7 @@ function assertDate(name: string, value: string): void {
 export class BalanceSheetUseCase {
   constructor(private readonly repos: Repos) {}
 
-  async execute(input: { organizationId: string; asOf: string; compareAsOf?: string; costCenterId?: string; includeZero?: boolean; maxLevel?: number }): Promise<BalanceSheet> {
+  async execute(input: { organizationId: string; asOf: string; compareAsOf?: string; costCenterId?: string; projectId?: string; includeZero?: boolean; maxLevel?: number }): Promise<BalanceSheet> {
     assertDate('asOf', input.asOf);
     if (input.compareAsOf !== undefined) assertDate('compareAsOf', input.compareAsOf);
     const accounts = await this.repos.accounts.list(input.organizationId);
@@ -86,6 +87,7 @@ export class BalanceSheetUseCase {
         to: date,
         yearStart: await yearStartFor(this.repos, input.organizationId, date),
         costCenterId: input.costCenterId,
+        projectId: input.projectId,
       });
     return buildBalanceSheet({
       accounts,
@@ -110,6 +112,7 @@ export class IncomeStatementUseCase {
     compareFrom?: string;
     compareTo?: string;
     costCenterId?: string;
+    projectId?: string;
     includeZero?: boolean;
     maxLevel?: number;
   }): Promise<IncomeStatement> {
@@ -120,7 +123,7 @@ export class IncomeStatementUseCase {
     if (input.compareFrom !== undefined && input.compareTo !== undefined) assertRange(input.compareFrom, input.compareTo);
     const accounts = await this.repos.accounts.list(input.organizationId);
     const sumsFor = async (from: string, to: string) =>
-      this.repos.reports.sumByAccount(input.organizationId, { from, to, yearStart: await yearStartFor(this.repos, input.organizationId, from), costCenterId: input.costCenterId });
+      this.repos.reports.sumByAccount(input.organizationId, { from, to, yearStart: await yearStartFor(this.repos, input.organizationId, from), costCenterId: input.costCenterId, projectId: input.projectId });
     return buildIncomeStatement({
       accounts,
       sums: await sumsFor(input.from, input.to),

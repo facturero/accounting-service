@@ -49,6 +49,13 @@ export const POSTING_EVENT_TYPES = [
 
 export const GENERAL_LEDGER_PLUGIN = 'finance.general_ledger';
 
+/**
+ * Eventos de projects-service que dicen a qué proyecto pertenece una factura. `linked` llega al crear el borrador desde la pestaña
+ * «Facturación» del proyecto, antes de emitir; `issued`, después, y sirve de respaldo si el primero se perdió. Con eso, el asiento de
+ * `billing.invoice.issued` (y el costo de ventas de esa factura) sale con la dimensión «proyecto».
+ */
+export const PROJECT_TAG_EVENT_TYPES = ['projects.invoice.linked', 'projects.invoice.issued'] as const;
+
 export type ProcessResult =
   | { outcome: 'posted'; entryId: string }
   | { outcome: 'duplicate'; entryId: string | null }
@@ -165,6 +172,38 @@ export class AutomaticPostingUseCase {
     if (waiting && waiting.status === 'pending') await this.retry(organizationId, [waiting.id]);
   }
 
+  /**
+   * Anota a qué proyecto pertenece una factura (ver PROJECT_TAG_EVENT_TYPES). No contabiliza nada: el asiento lo arma
+   * `billing.invoice.issued`, que mira esta anotación. Se guarda aunque la organización aún no tenga contabilidad: si la configura
+   * después, los reintentos de pendientes ya encuentran el proyecto.
+   */
+  async tagSourceProject(payload: unknown): Promise<boolean> {
+    const p = (payload ?? {}) as Record<string, unknown>;
+    const { organizationId, invoiceId, projectId } = p;
+    if (typeof organizationId !== 'string' || typeof invoiceId !== 'string' || typeof projectId !== 'string' || !invoiceId) return false;
+    const uow = await this.gateway.begin();
+    try {
+      await uow.sourceProjects.save(organizationId, 'invoice', invoiceId, projectId);
+      await uow.commit();
+      return true;
+    } catch (err) {
+      await uow.rollback();
+      throw err;
+    }
+  }
+
+  /**
+   * El proyecto del documento que se contabiliza: el de la factura, o, para el costo de ventas de una venta, el de la factura que lo
+   * originó. Va en todas las líneas del asiento (ingreso, IVA, cliente): así el mayor y el estado de resultados por proyecto cuadran.
+   */
+  private async projectFor(uow: WriteUnitOfWork, organizationId: string, draft: PostingDraft, payload: Record<string, unknown>): Promise<string | null> {
+    if (draft.sourceType === 'invoice') return uow.sourceProjects.find(organizationId, 'invoice', draft.sourceId);
+    if (draft.sourceType === 'stock_movement' && payload.referenceType === 'invoice' && typeof payload.referenceId === 'string') {
+      return uow.sourceProjects.find(organizationId, 'invoice', payload.referenceId);
+    }
+    return null;
+  }
+
   /** Intenta contabilizar un evento. NO toca `pending_postings`: lo hacen `handle` y `retry`. */
   async process(organizationId: string, eventType: string, payload: Record<string, unknown>): Promise<ProcessResult> {
     const uow = await this.gateway.begin();
@@ -232,14 +271,14 @@ export class AutomaticPostingUseCase {
       if (invoiceEntry?.reference) draft.description = draft.description.replace(payload.referenceId, invoiceEntry.reference);
     }
 
-    return this.postDraft(uow, organizationId, draft);
+    return this.postDraft(uow, organizationId, draft, await this.projectFor(uow, organizationId, draft, payload));
   }
 
   private pending(draft: PostingDraft, reasonCode: string, message: string): PendingResult {
     return { outcome: 'pending', reasonCode, message, sourceType: draft.sourceType, sourceId: draft.sourceId, entryDate: draft.entryDate };
   }
 
-  private async postDraft(uow: WriteUnitOfWork, organizationId: string, draft: PostingDraft): Promise<Step> {
+  private async postDraft(uow: WriteUnitOfWork, organizationId: string, draft: PostingDraft, projectId: string | null = null): Promise<Step> {
     const accounts = await uow.accounts.list(organizationId);
     const byRole = new Map<string, Account>();
     for (const a of accounts) if (a.systemRole) byRole.set(a.systemRole, a);
@@ -261,6 +300,7 @@ export class AutomaticPostingUseCase {
         partyType: l.partyType ?? null,
         partyId: l.partyId ?? null,
         establishmentId: l.establishmentId ?? null,
+        projectId,
       });
     }
 

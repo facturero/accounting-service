@@ -301,3 +301,25 @@ PendingPostingModel.init(
   },
   { sequelize, tableName: 'pending_postings', timestamps: false },
 );
+
+/** Documento de otro servicio → proyecto (ver la migración `source-projects`). */
+export class SourceProjectModel extends Model<InferAttributes<SourceProjectModel>, InferCreationAttributes<SourceProjectModel>> {
+  declare organization_id: string;
+  declare source_type: string;
+  declare source_id: string;
+  declare project_id: string;
+  declare created_at: Date;
+  declare updated_at: Date;
+}
+
+SourceProjectModel.init(
+  {
+    organization_id: { type: DataTypes.CHAR(36), primaryKey: true },
+    source_type: { type: DataTypes.STRING(50), primaryKey: true },
+    source_id: { type: DataTypes.STRING(64), primaryKey: true },
+    project_id: { type: DataTypes.CHAR(36), allowNull: false },
+    created_at: DataTypes.DATE,
+    updated_at: DataTypes.DATE,
+  },
+  { sequelize, tableName: 'source_projects', timestamps: false },
+);

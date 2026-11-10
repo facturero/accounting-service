@@ -107,6 +107,16 @@ channels:
       description: >-
         Reversa el asiento automático del ajuste, con el motivo en la descripción. Si el ajuste todavía no tenía asiento (estaba pendiente),
         descarta el pendiente; si la anulación llega antes que la contabilización, queda pendiente `ORIGINAL_NOT_POSTED` y se reversa al contabilizarse.
+  projects.invoice.linked:
+    subscribe:
+      summary: Una factura se creó desde un proyecto → se anota su proyecto (dimensión «proyecto»)
+      description: >-
+        projects-service lo publica al crear el borrador desde la pestaña «Facturación» del proyecto, antes de emitir. No genera asiento:
+        guarda (`organizationId`, factura `invoiceId`) → `projectId` en `source_projects`, y al contabilizar `billing.invoice.issued` de
+        esa factura todas las líneas salen con ese proyecto, igual que el costo de ventas que la referencia y la reversa si se anula.
+  projects.invoice.issued:
+    subscribe:
+      summary: La factura del proyecto se emitió → misma anotación, de respaldo si `linked` no llegó
   plugin.activated:
     subscribe:
       summary: Si el código es `finance.general_ledger`, enciende la contabilización automática

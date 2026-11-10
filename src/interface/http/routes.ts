@@ -282,6 +282,7 @@ export function accountingRoutes(deps: AppDependencies): Hono<Vars> {
       from: requiredDate(c, 'from'),
       to: requiredDate(c, 'to'),
       costCenterId: c.req.query('costCenterId') || undefined,
+      projectId: c.req.query('projectId') || undefined,
       includeZero: c.req.query('includeZero') === 'true',
       maxLevel: maxLevel ? intParam(maxLevel, 10, 1, 10) : undefined,
     });
@@ -295,6 +296,7 @@ export function accountingRoutes(deps: AppDependencies): Hono<Vars> {
       asOf: requiredDate(c, 'asOf'),
       compareAsOf,
       costCenterId: c.req.query('costCenterId') || undefined,
+      projectId: c.req.query('projectId') || undefined,
       includeZero: c.req.query('includeZero') === 'true',
       maxLevel: maxLevel ? intParam(maxLevel, 10, 1, 10) : undefined,
     });
@@ -309,6 +311,7 @@ export function accountingRoutes(deps: AppDependencies): Hono<Vars> {
       compareFrom: c.req.query('compareFrom') || undefined,
       compareTo: c.req.query('compareTo') || undefined,
       costCenterId: c.req.query('costCenterId') || undefined,
+      projectId: c.req.query('projectId') || undefined,
       includeZero: c.req.query('includeZero') === 'true',
       maxLevel: maxLevel ? intParam(maxLevel, 10, 1, 10) : undefined,
     });

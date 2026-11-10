@@ -1,6 +1,6 @@
 import { EventHandler, InboxConsumer } from '@facturero/outbox-relay';
 import type { Sequelize } from 'sequelize';
-import { AutomaticPostingUseCase, POSTING_EVENT_TYPES } from '../../application/use-cases/automatic-posting.js';
+import { AutomaticPostingUseCase, POSTING_EVENT_TYPES, PROJECT_TAG_EVENT_TYPES } from '../../application/use-cases/automatic-posting.js';
 import { SetAutoPostingByPluginUseCase } from '../../application/use-cases/posting-settings-use-cases.js';
 
 /**
@@ -8,7 +8,7 @@ import { SetAutoPostingByPluginUseCase } from '../../application/use-cases/posti
  * reintentos con espera y el estado `failed` en `processed_events`. Lo que es un asunto de negocio (periodo cerrado, cuenta sin
  * rol) NO es un fallo del consumidor: queda en `pending_postings` y el evento se da por procesado.
  */
-export const CONSUMED_BINDINGS = [...POSTING_EVENT_TYPES, 'plugin.activated', 'plugin.deactivated'] as const;
+export const CONSUMED_BINDINGS = [...POSTING_EVENT_TYPES, ...PROJECT_TAG_EVENT_TYPES, 'plugin.activated', 'plugin.deactivated'] as const;
 
 export interface ConsumerDeps {
   posting: AutomaticPostingUseCase;
@@ -26,8 +26,16 @@ export function buildEventHandlers(deps: ConsumerDeps): EventHandler[] {
     },
   }));
 
+  const projectTags: EventHandler[] = PROJECT_TAG_EVENT_TYPES.map((eventType) => ({
+    eventType,
+    handle: async (payload: unknown): Promise<void> => {
+      await deps.posting.tagSourceProject(payload);
+    },
+  }));
+
   return [
     ...posting,
+    ...projectTags,
     {
       eventType: 'plugin.activated',
       handle: async (payload: unknown): Promise<void> => {

@@ -386,6 +386,7 @@ paths:
         - { name: from, in: query, required: true, schema: { type: string, format: date } }
         - { name: to, in: query, required: true, schema: { type: string, format: date } }
         - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: projectId, in: query, description: 'Solo lo contabilizado con ese proyecto (dimensión «proyecto»).', schema: { type: string, format: uuid } }
         - { name: includeZero, in: query, schema: { type: boolean } }
         - { name: maxLevel, in: query, schema: { type: integer } }
       responses:
@@ -403,6 +404,7 @@ paths:
         - { name: asOf, in: query, required: true, schema: { type: string, format: date } }
         - { name: compareAsOf, in: query, schema: { type: string, format: date } }
         - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: projectId, in: query, description: 'Solo lo contabilizado con ese proyecto (dimensión «proyecto»).', schema: { type: string, format: uuid } }
         - { name: includeZero, in: query, schema: { type: boolean } }
         - { name: maxLevel, in: query, schema: { type: integer } }
       responses:
@@ -440,6 +442,7 @@ paths:
         - { name: compareFrom, in: query, schema: { type: string, format: date } }
         - { name: compareTo, in: query, schema: { type: string, format: date } }
         - { name: costCenterId, in: query, schema: { type: string, format: uuid } }
+        - { name: projectId, in: query, description: 'Solo lo contabilizado con ese proyecto (dimensión «proyecto»).', schema: { type: string, format: uuid } }
         - { name: includeZero, in: query, schema: { type: boolean } }
         - { name: maxLevel, in: query, schema: { type: integer } }
       responses:

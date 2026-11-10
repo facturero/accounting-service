@@ -62,6 +62,7 @@ interface Snapshot {
   periods: Map<string, FiscalPeriod>;
   entries: Map<string, JournalEntry>;
   pending: Map<string, PendingPosting>;
+  sourceProjects: Map<string, string>;
   counters: Map<string, number>;
   outboxLength: number;
 }
@@ -75,6 +76,7 @@ export class InMemoryStore implements UnitOfWorkGateway {
   periodMap = new Map<string, FiscalPeriod>();
   entryMap = new Map<string, JournalEntry>();
   pendingMap = new Map<string, PendingPosting>();
+  sourceProjects = new Map<string, string>();
   counters = new Map<string, number>();
   readonly outboxEvents: DomainEvent[] = [];
   private snapshotStack: Snapshot[] = [];
@@ -88,6 +90,7 @@ export class InMemoryStore implements UnitOfWorkGateway {
       periods: new Map([...this.periodMap].map(([k, v]) => [k, FiscalPeriod.fromPersistence(v.toPersistence())])),
       entries: new Map([...this.entryMap].map(([k, v]) => [k, cloneEntry(v)])),
       pending: new Map([...this.pendingMap].map(([k, v]) => [k, { ...v }])),
+      sourceProjects: new Map(this.sourceProjects),
       counters: new Map(this.counters),
       outboxLength: this.outboxEvents.length,
     });
@@ -104,6 +107,7 @@ export class InMemoryStore implements UnitOfWorkGateway {
         store.periodMap = snap.periods;
         store.entryMap = snap.entries;
         store.pendingMap = snap.pending;
+        store.sourceProjects = snap.sourceProjects;
         store.counters = snap.counters;
         store.outboxEvents.length = snap.outboxLength;
       },
@@ -208,6 +212,7 @@ export class InMemoryStore implements UnitOfWorkGateway {
             if (e.status !== 'posted' || e.entryDate > f.to) continue;
             for (const l of e.lines) {
               if (f.costCenterId && l.costCenterId !== f.costCenterId) continue;
+              if (f.projectId && l.projectId !== f.projectId) continue;
               const row = sums.get(l.accountId) ?? { accountId: l.accountId, netBeforeFrom: 0, netBeforeYearStart: 0, debit: 0, credit: 0 };
               const net = l.debitCents - l.creditCents;
               if (e.entryDate < f.from) row.netBeforeFrom += net;
@@ -272,6 +277,10 @@ export class InMemoryStore implements UnitOfWorkGateway {
         },
         async countPending(org) { return [...s.pendingMap.values()].filter((x) => x.organizationId === org && x.status === 'pending').length; },
         async save(row) { s.pendingMap.set(row.id, { ...row }); },
+      },
+      sourceProjects: {
+        async find(org, sourceType, sourceId) { return s.sourceProjects.get(`${org}:${sourceType}:${sourceId}`) ?? null; },
+        async save(org, sourceType, sourceId, projectId) { s.sourceProjects.set(`${org}:${sourceType}:${sourceId}`, projectId); },
       },
       outbox: { async add(ev) { s.outboxEvents.push(ev); } },
     };
