@@ -4,7 +4,7 @@ import { ACCOUNT_TYPES, SYSTEM_ROLES } from '../../domain/account.js';
 import { ValidationError } from '../../domain/errors.js';
 
 const LOCAL_DATE = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'La fecha debe tener el formato YYYY-MM-DD.');
-const UUID = z.string().uuid('El identificador no es válido.');
+const UUID = z.string().guid('El identificador no es válido.');
 const CENTS = z.number().int('Los importes van en centavos enteros.').min(0, 'El importe no puede ser negativo.').max(Number.MAX_SAFE_INTEGER);
 
 export const setupSchema = z
@@ -49,7 +49,7 @@ export const updatePostingSettingsSchema = z
   .partial()
   .strict();
 
-export const retryPendingSchema = z.object({ ids: z.array(z.string().uuid()).max(200).optional() }).strict();
+export const retryPendingSchema = z.object({ ids: z.array(z.string().guid()).max(200).optional() }).strict();
 export const discardPendingSchema = z.object({ reason: z.string().min(3, 'Indica el motivo.').max(200) }).strict();
 
 export const createCostCenterSchema = z
